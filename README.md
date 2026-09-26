@@ -1,12 +1,15 @@
-# OmaDAW — low-latency audio production on Omarchy
+# OmaDAW
 
-Setup for realtime PipeWire audio, Windows VSTs (dedicated Wine prefix +
-yabridge), and Bitwig / Reaper / Ardour routing on Omarchy.
+**Agentic DAW setup for the busy studio engineer.**
 
-## Quick start
+OmaDAW is how you and an agent set up an Omarchy machine for low-latency
+recording: realtime PipeWire, a dedicated Wine prefix and yabridge for
+Windows VSTs, and routing for Bitwig, Reaper, and Ardour. You say what you
+need. The agent reads `AGENTS.md` and the skills in `skills/`, then runs the
+idempotent scripts in this repo. You stay in the session for the parts only
+you can do: logins, licenses, and listening.
 
-`omadaw` prepares the system, checks its health, and drops you into the
-default agent harness (repo skills in context) on request:
+## Work with the agent
 
 ```bash
 ./omadaw --profile studio --with-daw all --yes   # set up (idempotent)
@@ -14,36 +17,44 @@ default agent harness (repo skills in context) on request:
 ./omadaw agent "set up for a USB interface at 128 frames with Reaper"
 ```
 
-## What you get
+`./omadaw agent "<goal>"` opens the Omarchy default agent with this repo as
+context. A goal is a sentence: install a plugin, fix a silent DAW, bridge a
+new VST, or drop the quantum to 128. The skills tell the agent what is
+already known on this machine, so it does not rediscover the audio stack
+from scratch.
 
-- **Realtime:** `realtime-privileges` + `rtkit`, user in `realtime` group.
-- **PipeWire profiles:** `studio` 128 / `balanced` 256 / `safe` 512 frames @ 48 kHz
-  (`config/pipewire/...`, switch live with `bin/omadaw-route profile <name>`).
-- **Windows VSTs:** dedicated `~/.wine-omadaw` prefix (not `~/.wine`) + yabridge:
+## What the agent sets up
+
+- **Realtime:** `realtime-privileges` + `rtkit`, user in the `realtime` group.
+  A reboot or a full login is required before realtime is actually active.
+- **PipeWire profiles:** `studio` 128 / `balanced` 256 / `safe` 512 frames
+  at 48 kHz (`config/pipewire/...`). Switch live with
+  `bin/omadaw-route profile <name>`.
+- **Windows VSTs:** dedicated `~/.wine-omadaw` prefix (not `~/.wine`) and
+  yabridge.
   ```bash
   bin/omadaw-vst install ~/Downloads/SomePluginSetup.exe
   bin/omadaw-vst sync          # discover new/updated plugins
   bin/omadaw-vst enable-watch  # background auto-sync on new files
   bin/omadaw-vst doctor
   ```
-- **DAWs:** Reaper + Ardour from repos, Bitwig from AUR (asks first);
-  per-DAW backend/plugin notes in `config/daw/`; launch with
-  `bin/omadaw-route launch <bitwig|reaper|ardour>`; patch with `qpwgraph`.
-- **Rollback:** `./omadaw --snapshot ...` snapshots system (snapper) +
-  user state (`~/.wine-omadaw`, pipewire conf, shims) first; retest with
-  `bin/omadaw-snapshot rollback-system` + `rollback-user latest`.
+- **DAWs:** Reaper and Ardour from the repos, Bitwig from the AUR (the agent
+  asks first). Backend and plugin-path notes live in `config/daw/`. Launch
+  with `bin/omadaw-route launch <bitwig|reaper|ardour>`. Patch with
+  `qpwgraph`.
+- **Rollback:** `./omadaw --snapshot ...` snapshots the system (snapper) and
+  user state (`~/.wine-omadaw`, PipeWire config, shims) first. Restore with
+  `bin/omadaw-snapshot rollback-system` and `rollback-user latest`.
 
-## Troubleshooting
+## When a library fills the disk
 
-- **Running out of disk during big sound-library installs:** move the library
-  directory to a roomier disk and symlink it back, e.g.
-  `mv ~/.wine-omadaw/drive_c/.../Toontrack /games/soundlibs/ && ln -s
-  /games/soundlibs/Toontrack <original-path>`. Wine follows the link, so all
-  `C:\…` paths keep working with nothing to reconfigure. Stop the apps using
-  the files first.
+Move the library directory to a roomier disk and symlink it back, for example
+`mv ~/.wine-omadaw/drive_c/.../Toontrack /games/soundlibs/ && ln -s
+/games/soundlibs/Toontrack <original-path>`. Wine follows the link, so the
+`C:\…` paths keep working. Stop the apps that have those files open first.
 
 ## Repo layout
 
-See `AGENTS.md` (agent handbook) for the full map, Omarchy conventions, and
-verification commands. Agent skills live in `skills/omadaw-audio/` and
-`skills/omadaw-vst/`.
+`AGENTS.md` is the handbook the agent reads first: the map, Omarchy
+conventions, and verification commands. Skills live in `skills/omadaw-audio/`
+and `skills/omadaw-vst/`.
