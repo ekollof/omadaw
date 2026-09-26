@@ -1,0 +1,8 @@
+# Runs on PathChanged from omadaw-vst-sync.path. One-shot yabridge sync.
+[Unit]
+Description=OmaDAW: yabridge sync after VST directory change
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/yabridgectl sync
+Nice=10

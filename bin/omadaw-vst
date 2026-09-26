@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+# omadaw-vst — dedicated Wine/Proton prefix + yabridge bridge manager for Windows VSTs.
+#
+#   omadaw-vst init [--prefix PATH] [--proton GE-ProtonX|--wine]
+#   omadaw-vst install <setup.exe|setup.msi|/path/to/installer>  # runs installer INTO the prefix
+#   omadaw-vst run <exe inside prefix> [args...]                 # e.g. omadaw-vst run "drive_c/Program Files/..."
+#   omadaw-vst add <plugin-dir>      # register a dir with yabridgectl
+#   omadaw-vst sync                  # (re)sync bridges; discovers new/updated plugins
+#   omadaw-vst list                  # show bridged plugins + status
+#   omadaw-vst remove <plugin-dir>   # unregister a dir
+#   omadaw-vst doctor                # diagnose prefix + yabridge health
+#   omadaw-vst test [--all|pattern...] [--timeout S] [--jobs J]
+#                                    # load-test plugins headlessly (no DAW);
+#                                    # default = smoke subset (all shells + 2+2 canaries)
+#   omadaw-vst enable-watch|disable-watch|watch-status  # auto-sync on new files
+#
+# Env: WINEPREFIX defaults to ~/.wine-omadaw (NOT ~/.wine, to keep games out).
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PREFIX="${WINEPREFIX:-$HOME/.wine-omadaw}"
+RUNNER="wine"   # or path to umu-run / proton build when --proton is used
+
+log()  { printf '[omadaw-vst] %s\n' "$*"; }
+warn() { printf '[omadaw-vst:warn] %s\n' "$*" >&2; }
+die()  { printf '[omadaw-vst:error] %s\n' "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Standard plugin locations we always bridge (prefix-local + linux homes).
+default_plugin_dirs() {
+  printf '%s\n' \
+    "$PREFIX/drive_c/Program Files/Steinberg/VstPlugins" \
+    "$PREFIX/drive_c/Program Files/Common Files/VST3" \
+    "$PREFIX/drive_c/Program Files/Common Files/VST2" \
+    "$HOME/.vst" \
+    "$HOME/.vst3"
+}
+
+ensure_deps() {
+  have yabridgectl || die "yabridgectl not found. Run ./omadaw first (omarchy pkg add yabridge yabridgectl)"
+  have wine || have umu-run || die "no wine/proton runner found (wine-staging or umu-launcher)"
+}
+
+wine_env() {
+  export WINEPREFIX="$PREFIX"
+  export WINEDEBUG="${WINEDEBUG:--all}"
+}
+
+cmd_init() {
+  local proton=""
+  while (($#)); do
+    case "$1" in
+      --prefix) PREFIX="$2"; shift 2 ;;
+      --proton) proton="$2"; shift 2 ;;
+      --wine) proton=""; shift ;;
+      *) die "init: unknown flag $1" ;;
+    esac
+  done
+  ensure_deps
+  wine_env
+  mkdir -p "$PREFIX"
+  if [[ -n $proton ]]; then
+    # Proton path: prefer umu-launcher (Omarchy's gaming stack) when available.
+    if have umu-run; then
+      RUNNER="umu-run"
+      log "Using umu-run with PROTON $proton in $PREFIX"
+      GAMEID=omadaw-vst WINEPREFIX="$PREFIX" PROTONPATH="$proton" umu-run wineboot --init || true
+    else
+      warn "umu-run not found; falling back to wine-staging. Install with: omarchy install gaming lutris"
+      wineboot --init
+    fi
+  else
+    [[ -d $PREFIX/drive_c ]] || { log "wineboot --init in $PREFIX"; wineboot --init; }
+  fi
+  # Create plugin homes + register them with yabridgectl.
+  while IFS= read -r d; do mkdir -p "$d"; done < <(default_plugin_dirs)
+  while IFS= read -r d; do
+    if [[ -d $d ]]; then yabridgectl add "$d" 2>/dev/null || true; fi
+  done < <(default_plugin_dirs)
+  log "Syncing yabridge…"
+  yabridgectl sync || yabridgectl sync --no-verify || warn "sync had errors — run 'omadaw-vst doctor'"
+  log "Prefix ready: $PREFIX"
+}
+
+cmd_install() {
+  [[ $# -ge 1 ]] || die "usage: omadaw-vst install <setup.exe|setup.msi|installer>"
+  ensure_deps
+  wine_env
+  local installer="$1"; shift
+  [[ -f $installer ]] || die "installer not found: $installer"
+  log "Running installer in $PREFIX: $installer"
+  case "$installer" in
+    *.msi|*.MSI) wine msiexec /i "$installer" "$@" ;;
+    *.exe|*.EXE) wine "$installer" "$@" ;;
+    *) warn "Unknown extension, trying wine directly…"; wine "$installer" "$@" ;;
+  esac
+  log "Installer finished — syncing bridges to discover new plugins…"
+  cmd_sync
+}
+
+cmd_run() {
+  [[ $# -ge 1 ]] || die "usage: omadaw-vst run <exe-in-prefix> [args...]"
+  ensure_deps
+  wine_env
+  local exe="$1"; shift
+  # Allow relative-to-prefix paths ("drive_c/...") or absolute.
+  [[ $exe == /* ]] || exe="$PREFIX/$exe"
+  [[ -f $exe ]] || die "exe not found: $exe"
+  wine "$exe" "$@"
+}
+
+cmd_add() {
+  [[ $# -ge 1 ]] || die "usage: omadaw-vst add <plugin-dir>"
+  ensure_deps
+  # Never register shim homes (or anything under them) as sources: yabridge
+  # would bridge its own output into nested yabridge/yabridge/... dirs.
+  local d
+  d="$(realpath -m "$1")"
+  for home in "$HOME/.vst" "$HOME/.vst3" "$HOME/.clap" "$HOME/.lv2"; do
+    if [[ $d == "$home" || $d == "$home"/* ]]; then
+      die "refusing to register $1: yabridge writes its shims there (add the Windows dir holding the real plugins instead)"
+    fi
+  done
+  yabridgectl add "$1"
+  cmd_sync
+}
+
+cmd_sync() {
+  ensure_deps
+  log "Syncing yabridge bridges (discovers new/updated plugins)…"
+  # --prune removes stale .so shims; plain sync keeps them. Prune is safer
+  # after uninstalls, plain sync is safer day-to-day. Do plain, report.
+  if yabridgectl sync; then
+    log "sync ok"
+  else
+    warn "sync reported failures — retrying with --no-verify"
+    yabridgectl sync --no-verify || die "sync failed; run 'omadaw-vst doctor'"
+  fi
+  local new_count
+  new_count=$(find ~/.vst ~/.vst3 -name '*.so' 2>/dev/null | wc -l)
+  log "Bridged .so shims in ~/.vst{,3}: $new_count"
+}
+
+cmd_list() {
+  ensure_deps
+  yabridgectl status 2>/dev/null || yabridgectl list 2>/dev/null || {
+    echo "--- ~/.vst ---"; ls ~/.vst 2>/dev/null || true
+    echo "--- ~/.vst3 ---"; ls ~/.vst3 2>/dev/null || true
+  }
+}
+
+cmd_remove() {
+  [[ $# -ge 1 ]] || die "usage: omadaw-vst remove <plugin-dir>"
+  ensure_deps
+  yabridgectl rm "$1"
+  cmd_sync
+}
+
+DISCOVER=/usr/lib/carla/carla-discovery-native
+
+# Load-test ONE bridged shim through the full chain (Wine + yabridge + init).
+# Prints one result line; returns 0 on PASS, 1 on EMPTY/CRASH/TIMEOUT.
+test_one() {
+  local shim="$1" timeout_s="$2" type out rc count
+  case "$shim" in
+    *.vst3) type=vst3 ;;
+    *) type=vst2 ;;
+  esac
+  out="$(timeout -k 10 "${timeout_s}" "$DISCOVER" "$type" "$shim" 2>&1)"
+  rc=$?
+  count="$(printf '%s' "$out" | grep -c "carla-discovery::name::")"
+  if ((rc == 124)); then
+    printf 'TIMEOUT(%ss)\t%s\n' "$timeout_s" "$shim"; return 1
+  elif ((rc != 0)); then
+    printf 'CRASH(rc=%d)\t%s\n' "$rc" "$shim"; return 1
+  elif ((count == 0)); then
+    printf 'EMPTY\t%s\n' "$shim"; return 1
+  else
+    printf 'PASS(%d)\t%s\n' "$count" "$shim"; return 0
+  fi
+}
+
+cmd_test() {
+  local timeout_s=60 jobs=4 all=false
+  local -a patterns=()
+  while (($#)); do
+    case "$1" in
+      --timeout) timeout_s="${2:?--timeout needs seconds}"; shift 2 ;;
+      --jobs) jobs="${2:?--jobs needs a count}"; shift 2 ;;
+      --all) all=true; shift ;;
+      -h|--help)
+        echo "usage: omadaw-vst test [--all | pattern...] [--timeout S] [--jobs J]"
+        echo "  no args: smoke subset (every *shell* + first 2 VST2 + first 2 VST3)"
+        echo "  patterns match shim paths (e.g. test AmpliTube, test WaveShell)"
+        echo "  verdicts: PASS(n) | EMPTY (loads, enumerates nothing) | CRASH | TIMEOUT"
+        return 0 ;;
+      *) patterns+=("$1"); shift ;;
+    esac
+  done
+  [[ $timeout_s =~ ^[0-9]+$ && $jobs =~ ^[0-9]+$ && $jobs -ge 1 ]] ||
+    die "test: --timeout/--jobs need positive integers"
+  [[ -x $DISCOVER ]] || die "test needs $DISCOVER (omarchy pkg add carla)"
+  local -a shims=() sel=()
+  mapfile -t shims < <(find ~/.vst ~/.vst3 -mindepth 1 -maxdepth 2 \( -name '*.so' -o -name '*.vst3' \) 2>/dev/null | sort)
+  ((${#shims[@]})) || die "test: no bridged shims found (run omadaw-vst sync first)"
+  if $all || ((${#patterns[@]})); then
+    local s p
+    for s in "${shims[@]}"; do
+      if $all; then sel+=("$s"); continue; fi
+      for p in "${patterns[@]}"; do
+        if [[ $s == *"$p"* ]]; then sel+=("$s"); break; fi
+      done
+    done
+  else
+    local s v2=0 v3=0
+    for s in "${shims[@]}"; do
+      if [[ ${s,,} == *shell* ]]; then sel+=("$s"); fi
+    done
+    for s in "${shims[@]}"; do
+      if [[ $s == *.so && ${s,,} != *shell* && $v2 -lt 2 ]]; then sel+=("$s"); v2=$((v2 + 1)); fi
+      if [[ $s == *.vst3 && ${s,,} != *shell* && $v3 -lt 2 ]]; then sel+=("$s"); v3=$((v3 + 1)); fi
+    done
+  fi
+  ((${#sel[@]})) || die "test: nothing selected"
+  log "load-testing ${#sel[@]} plugin(s) (timeout=${timeout_s}s jobs=$jobs)…"
+  local results fail=0
+  results="$(mktemp)"
+  export DISCOVER
+  export OMADAW_TEST_TIMEOUT="$timeout_s" OMADAW_TEST_RESULTS="$results"
+  export -f test_one
+  printf '%s\n' "${sel[@]}" |
+    xargs -P "$jobs" -I{} bash -c 'test_one "$@" "$OMADAW_TEST_TIMEOUT" >> "$OMADAW_TEST_RESULTS"; test ${PIPESTATUS[0]} -eq 0' _ {} 2>/dev/null ||
+    true
+  # NOTE: per-plugin verdicts above; summarize here (sorted for determinism).
+  local line st
+  while IFS=$'\t' read -r st _; do
+    [[ $st == PASS* ]] || fail=$((fail + 1))
+  done < <(sort "$results")
+  sort "$results"
+  printf '[omadaw-vst] test result: %d/%d passed\n' "$(( $(wc -l < "$results") - fail ))" "$(wc -l < "$results")"
+  rm -f "$results"
+  return $((fail > 0))
+}
+
+cmd_doctor() {
+  local fail=0
+  ok()   { printf '[ok] %s\n' "$1"; }
+  bad()  { printf '[FAIL] %s\n' "$1"; fail=1; }
+  wine_env
+  have yabridgectl && ok "yabridgectl present" || bad "yabridgectl missing (run ./omadaw)"
+  have wine && ok "wine: $(wine --version 2>/dev/null)" || bad "wine missing"
+  have winedump && ok "winedump present (PE inspection for sync)" || bad "winedump missing — reinstall wine-staging (yabridge sync cannot inspect plugins without it)"
+  have goblin && ok "goblin present (fast PE parsing)" || printf '[info] goblin not installed (optional accelerator, unpackaged — winedump covers it)\n'
+  [[ -d $PREFIX/drive_c ]] && ok "prefix: $PREFIX" || bad "prefix missing: $PREFIX (run omadaw-vst init)"
+  if have yabridgectl; then
+    yabridgectl status >/dev/null 2>&1 && ok "yabridgectl status ok" || bad "yabridgectl status failed — run omadaw-vst sync"
+  fi
+  # Any bridged .so shims (VST2 shims and VST3 bundles both contain them).
+  if [[ -n $(find ~/.vst ~/.vst3 -name '*.so' 2>/dev/null | head -1) ]]; then
+    ok "bridged plugins present ($(find ~/.vst ~/.vst3 -name '*.so' 2>/dev/null | wc -l) shims)"
+  else
+    printf '[info] no bridged plugins yet — install one with: omadaw-vst install <setup.exe>\n'
+  fi
+  id -nG | tr ' ' '\n' | grep -qx realtime && ok "realtime group" || bad "not in realtime group — tell the user to reboot or relogin (ulimit -r must be 98)"
+  pgrep -x pipewire >/dev/null && ok "pipewire running" || bad "pipewire not running"
+  log "load-testing smoke subset (shells + canaries, no DAW needed)…"
+  if cmd_test; then
+    ok "smoke load-test passed"
+  else
+    bad "smoke load-test found failures (see above; full sweep: omadaw-vst test --all)"
+  fi
+  return $fail
+}
+
+WATCH_PATH="$HOME/.config/systemd/user/omadaw-vst-sync.path"
+WATCH_SVC="$HOME/.config/systemd/user/omadaw-vst-sync.service"
+
+cmd_enable_watch() {
+  mkdir -p ~/.config/systemd/user
+  cp "$REPO_DIR/config/systemd/user/omadaw-vst-sync.path" "$WATCH_PATH"
+  cp "$REPO_DIR/config/systemd/user/omadaw-vst-sync.service" "$WATCH_SVC"
+  # Point the service at this repo's sync (portable: call yabridgectl directly).
+  systemctl --user daemon-reload
+  systemctl --user enable --now omadaw-vst-sync.path
+  log "Watch enabled: new .dll/.vst3 under prefix or ~/.vst{,3} triggers yabridgectl sync"
+  systemctl --user status omadaw-vst-sync.path --no-pager || true
+}
+
+cmd_disable_watch() {
+  systemctl --user disable --now omadaw-vst-sync.path 2>/dev/null || true
+  log "Watch disabled"
+}
+
+cmd_watch_status() {
+  systemctl --user status omadaw-vst-sync.path --no-pager || true
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  init) cmd_init "$@" ;;
+  install) cmd_install "$@" ;;
+  run) cmd_run "$@" ;;
+  add) cmd_add "$@" ;;
+  sync) cmd_sync "$@" ;;
+  list) cmd_list "$@" ;;
+  remove|rm) cmd_remove "$@" ;;
+  doctor) cmd_doctor "$@" ;;
+  test) cmd_test "$@" ;;
+  enable-watch) cmd_enable_watch "$@" ;;
+  disable-watch) cmd_disable_watch "$@" ;;
+  watch-status) cmd_watch_status "$@" ;;
+  help|--help|-h|*) sed -n '2,20p' "$0" ;;
+esac

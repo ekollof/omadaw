@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# omadaw-snapshot — rollback support for retesting the "from scratch" setup.
+#
+# Omarchy system snapshots (snapper, config `root`) cover / but NOT /home, so
+# a faithful rollback needs two parts. This wrapper does both:
+#
+#   omadaw-snapshot create [description]  # system snapshot + user-state bundle
+#   omadaw-snapshot pre-install           # non-interactive create for omadaw --snapshot
+#   omadaw-snapshot list                  # system snapshots + user-state bundles
+#   omadaw-snapshot rollback-user <name|latest>  # restore ~/.wine-omadaw, pipewire conf, shims…
+#   omadaw-snapshot rollback-system       # guidance: system rollback needs a reboot
+#   omadaw-snapshot delete <name>         # drop a user-state bundle
+#
+# Retest flow: create -> ./omadaw ... -> verify -> rollback-system +
+# rollback-user -> ./omadaw ... (clean second run).
+set -euo pipefail
+
+STORE="$HOME/.local/share/omadaw/snapshots"
+WINE_DIR="${WINEPREFIX:-$HOME/.wine-omadaw}"
+
+log()  { printf '[omadaw-snapshot] %s\n' "$*"; }
+warn() { printf '[omadaw-snapshot:warn] %s\n' "$*" >&2; }
+die()  { printf '[omadaw-snapshot:error] %s\n' "$*" >&2; exit 1; }
+
+# Paths (absolute) that make up OmaDAW user state. Missing ones are skipped.
+user_paths() {
+  printf '%s\n' \
+    "$WINE_DIR" \
+    "$HOME/.config/pipewire/pipewire.conf.d/10-omadaw.conf" \
+    "$HOME/.config/systemd/user/omadaw-vst-sync.path" \
+    "$HOME/.config/systemd/user/omadaw-vst-sync.service" \
+    "$HOME/.config/omadaw-vst-paths.env" \
+    "$HOME/.vst" \
+    "$HOME/.vst3" \
+    "$HOME/.clap" \
+    "$HOME/.lv2"
+}
+
+slugify() { printf '%s' "$*" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | cut -c1-40; }
+
+cmd_create() {
+  local desc="${1:-manual}"
+  local stamp
+  stamp="$(date +%Y%m%d-%H%M%S)-$(slugify "$desc")"
+  local dir="$STORE/$stamp"
+  mkdir -p "$dir"
+
+  # Part 1: system snapshot (packages, /etc incl. realtime group). Self-elevating.
+  if command -v omarchy >/dev/null 2>&1; then
+    log "Creating system snapshot (omarchy snapshot create)…"
+    omarchy snapshot create || warn "system snapshot failed — user bundle continues"
+  else
+    warn "omarchy not found; skipping system snapshot (user bundle continues)"
+  fi
+
+  # Part 2: user-state bundle (snapper does not cover /home).
+  local rel=() abs=()
+  while IFS= read -r p; do
+    [[ -e $p ]] || continue
+    if [[ $p == "$HOME"/* ]]; then rel+=("${p#"$HOME"/}"); else abs+=("$p"); fi
+  done < <(user_paths)
+  printf '%s\n' "${rel[@]}" > "$dir/paths-home.txt"
+  printf '%s\n' "${abs[@]}" > "$dir/paths-abs.txt"
+  {
+    echo "description=$desc"
+    echo "created=$(date -Is)"
+    echo "wineprefix=$WINE_DIR"
+    echo "groups=$(id -nG)"
+    echo "omarchy_version=$(omarchy-version 2>/dev/null || echo unknown)"
+  } > "$dir/meta.env"
+  pw-metadata -n settings 2>/dev/null | grep -E "clock.(rate|quantum)" > "$dir/clock.txt" || true
+  if ((${#rel[@]} + ${#abs[@]} == 0)); then
+    warn "No OmaDAW user state exists yet — bundle holds metadata only (fresh machine?)"
+  fi
+  # Two tarballs so extraction roots stay unambiguous:
+  # home.tar.gz holds $HOME-relative entries, abs.tar.gz absolute ones (-P).
+  if ((${#rel[@]})); then
+    tar -czf "$dir/home.tar.gz" -C "$HOME" "${rel[@]}"
+  else
+    tar -czf "$dir/home.tar.gz" --files-from /dev/null
+  fi
+  if ((${#abs[@]})); then
+    tar -czPf "$dir/abs.tar.gz" "${abs[@]}"
+  fi
+  log "User-state bundle: $dir ($(du -sh "$dir" | cut -f1))"
+  log "Snapshot complete: $stamp"
+}
+
+cmd_pre_install() {
+  # Called by omadaw --snapshot: no prompts, fixed description.
+  cmd_create "pre-install"
+}
+
+cmd_list() {
+  echo "== system snapshots (snapper, config root) =="
+  if command -v snapper >/dev/null 2>&1; then
+    sudo -n snapper -c root list 2>/dev/null | head -n 20 || snapper -c root list 2>/dev/null | head -n 20 || echo "(snapper list needs sudo)"
+  else
+    echo "(snapper not installed)"
+  fi
+  echo "== user-state bundles ($STORE) =="
+  if [[ -d $STORE ]]; then
+    for d in "$STORE"/*/; do
+      [[ -d $d ]] || continue
+      # shellcheck disable=SC1091
+      desc="$(grep '^description=' "$d/meta.env" 2>/dev/null | cut -d= -f2-)"
+      echo "  $(basename "$d")  (${desc:-?}, $(du -sh "$d" 2>/dev/null | cut -f1))"
+    done
+  else
+    echo "  (none yet — run: omadaw-snapshot create)"
+  fi
+}
+
+resolve_bundle() {
+  local name="$1" dir
+  if [[ $name == "latest" ]]; then
+    dir="$(ls -d "$STORE"/*/ 2>/dev/null | sort | tail -1)"
+  else
+    dir="$STORE/${name%/}/"
+  fi
+  [[ -n ${dir:-} && -d $dir ]] || die "bundle not found: $name (see: omadaw-snapshot list)"
+  echo "$dir"
+}
+
+cmd_rollback_user() {
+  [[ $# -ge 1 ]] || die "usage: omadaw-snapshot rollback-user <name|latest>"
+  local dir
+  dir="$(resolve_bundle "$1")"
+  [[ -f $dir/home.tar.gz ]] || die "bundle has no home.tar.gz: $dir"
+  log "Restoring user state from $(basename "$dir")…"
+  systemctl --user stop omadaw-vst-sync.path 2>/dev/null || true
+  # Remove tracked paths first so files deleted after the snapshot don't linger.
+  while IFS= read -r p; do
+    [[ -n $p && -e $HOME/$p ]] && rm -rf "$HOME/$p"
+  done < "$dir/paths-home.txt" 2>/dev/null || true
+  while IFS= read -r p; do
+    [[ -n $p && -e $p ]] && rm -rf "$p"
+  done < "$dir/paths-abs.txt" 2>/dev/null || true
+  tar -xzf "$dir/home.tar.gz" -C "$HOME"
+  [[ -f $dir/abs.tar.gz ]] && tar -xzPf "$dir/abs.tar.gz" -C /
+  systemctl --user daemon-reload 2>/dev/null || true
+  command -v yabridgectl >/dev/null 2>&1 && yabridgectl sync 2>/dev/null || true
+  log "Restarting pipewire to apply restored profile…"
+  systemctl --user restart pipewire pipewire-pulse wireplumber 2>/dev/null || warn "pipewire restart failed — relogin applies it"
+  # shellcheck disable=SC1091
+  old_groups="$(grep '^groups=' "$dir/meta.env" 2>/dev/null | cut -d= -f2-)"
+  if [[ -n ${old_groups:-} ]] && ! id -nG | tr ' ' '\n' | grep -qx realtime && [[ $old_groups == *realtime* ]]; then
+    warn "realtime group missing vs snapshot ($old_groups) — system rollback restores /etc/group; else: sudo usermod -aG realtime \$USER + relogin"
+  fi
+  log "User-state rollback done. Verify: ./omadaw --check"
+}
+
+cmd_rollback_system() {
+  cat <<'EOF'
+System rollback restores / (packages, /etc) but NOT /home — pair it with
+'rollback-user' for a faithful from-scratch retest.
+
+  1. Reboot, pick the pre-install snapshot from the limine boot menu, or run:
+       omarchy snapshot restore
+  2. Back in the system, restore user state:
+       bin/omadaw-snapshot rollback-user latest
+  3. Re-run the installer clean:
+       ./omadaw --profile <name> --with-daw <set> --yes
+EOF
+}
+
+cmd_delete() {
+  [[ $# -ge 1 ]] || die "usage: omadaw-snapshot delete <name>"
+  local dir
+  dir="$(resolve_bundle "$1")"
+  rm -rf "$dir"
+  log "Deleted bundle $(basename "$dir")"
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  create) cmd_create "$@" ;;
+  pre-install) cmd_pre_install "$@" ;;
+  list) cmd_list "$@" ;;
+  rollback-user) cmd_rollback_user "$@" ;;
+  rollback-system) cmd_rollback_system "$@" ;;
+  delete) cmd_delete "$@" ;;
+  help|--help|-h|*) sed -n '2,12p' "$0" ;;
+esac

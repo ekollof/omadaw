@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# omadaw-migrate — (re)sync Windows VSTs from a mounted Windows drive into the OmaDAW prefix.
+#
+# File-copy migration is a snapshot; THIS script is the update strategy: after
+# updating plugins on the Windows side (or to pull in new ones), re-run it and
+# only deltas copy over (rsync), then yabridge re-syncs.
+#
+#   omadaw-migrate [--source /mnt/windows] [--dry-run]
+#
+# Rules (deliberate, do not "simplify"):
+# - NEVER writes to the Windows drive (rsync src->dst only, no --delete).
+# - NEVER touches WaveShell* files: Waves Central owns those in the prefix.
+# - NEVER deletes in the prefix (merged dirs hold Central installs too).
+# - Vendor managers/account apps are out of scope: IK Product Manager and
+#   Waves Central run in Wine for their own updates; Toontrack/NeuralDSP/
+#   Melodyne/Pulsar ship manual installers (run them via bin/omadaw-vst install).
+set -euo pipefail
+
+SRC="/mnt/windows"
+DRY=0
+while (($#)); do
+  case "$1" in
+    --source) SRC="${2:?--source needs a path}"; shift 2 ;;
+    --dry-run) DRY=1; shift ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    *) die "Unknown flag: $1 (see --help)" ;;
+  esac
+done
+
+DST="${WINEPREFIX:-$HOME/.wine-omadaw}/drive_c"
+WUSER="$DST/users/$USER"
+
+log()  { printf '[omadaw-migrate] %s\n' "$*"; }
+warn() { printf '[omadaw-migrate:warn] %s\n' "$*" >&2; }
+die()  { printf '[omadaw-migrate:error] %s\n' "$*" >&2; exit 1; }
+
+[[ -d $SRC ]] || die "windows drive not found: $SRC (mount it first, read-only is fine)"
+[[ -d $DST ]] || die "wine prefix not found at $DST (run ./omadaw first)"
+command -v rsync >/dev/null 2>&1 || die "need rsync (omarchy pkg add rsync)"
+
+RSYNC=(rsync -a --prune-empty-dirs)
+((DRY)) && RSYNC+=(--dry-run --itemize-changes)
+
+mirror() { # $1 = windows-relative src dir, $2 = prefix-relative dst dir, rest = rsync excludes
+  local s="$SRC/$1" d="$DST/$2"
+  shift 2
+  [[ -d $s ]] || { log "skip (absent on windows): $1"; return 0; }
+  mkdir -p "$d"
+  "${RSYNC[@]}" "$@" "$s/." "$d/"
+}
+
+log "Migrating VSTs: $SRC -> $DST (dry-run=$DRY)"
+
+# VST3 collection (Central-owned Waveshells excluded — Central manages those).
+mirror "Program Files/Common Files/VST3" "Program Files/Common Files/VST3" \
+  --exclude 'WaveShell*'
+
+# VST2 collections. VSTPlugIns is canonical; Steinberg skips the three files
+# duplicated there (same installers drop both) to avoid double shims in DAWs.
+mirror "Program Files/VSTPlugIns" "Program Files/VSTPlugIns" \
+  --exclude 'WaveShell*' --exclude 'Waves StudioRack for OBS.dll'
+mirror "Program Files/Steinberg/VstPlugins" "Program Files/Steinberg/VstPlugins" \
+  --exclude 'Addictive Drums 2.dll' --exclude 'Fortin Nameless Suite (x64).dll' \
+  --exclude 'Fortin NTS Suite (x64).dll'
+mirror "Program Files/Common Files/VST2" "Program Files/Common Files/VST2"
+mirror "Program Files/Native Instruments/VSTPlugins 64 bit" \
+  "Program Files/Native Instruments/VSTPlugins 64 bit"
+mirror "Program Files/Common Files/PositiveGrid" "Program Files/Common Files/PositiveGrid"
+
+# Support data (libraries, auth DBs, presets). Sizes live here — check du first on surprises.
+for vd in Toontrack "Neural DSP" Pulsar "Native Instruments"; do
+  mirror "ProgramData/$vd" "ProgramData/$vd"
+done
+
+# Per-user vendor state (IK Product Manager DB, Toontrack MIDI libs, presets).
+# Windows username differs from wine username; map explicitly.
+WINUSER="$(ls "$SRC/Users" 2>/dev/null | grep -vE "^(All Users|Default|Default User|Public|desktop.ini)$" | head -1)"
+if [[ -n ${WINUSER:-} ]]; then
+  for vd in "Celemony Software GmbH" "IK Multimedia" "IK Product Manager" "Neural DSP" Toontrack; do
+    mirror "Users/$WINUSER/AppData/Roaming/$vd" "users/$USER/AppData/Roaming/$vd"
+  done
+  mirror "Users/$WINUSER/AppData/Local/Toontrack" "users/$USER/AppData/Local/Toontrack"
+else
+  warn "no windows user profile found — skipping AppData vendor state"
+fi
+
+# IK Product Manager app itself (runs in Wine for IK updates).
+mirror "Program Files/IK Multimedia/IK Product Manager" \
+  "Program Files/IK Multimedia/IK Product Manager"
+
+if ((DRY)); then
+  log "Dry run done — re-run without --dry-run to apply"
+  exit 0
+fi
+
+# Register any new scan dirs (idempotent), then bridge.
+export WINEPREFIX="${WINEPREFIX:-$HOME/.wine-omadaw}"
+for pd in "Program Files/VSTPlugIns" \
+          "Program Files/Native Instruments/VSTPlugins 64 bit" \
+          "Program Files/Common Files/VST2"; do
+  yabridgectl add "$WINEPREFIX/drive_c/$pd" 2>/dev/null || true
+done
+"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/omadaw-vst" sync
+log "Done. Restart the DAW (or re-scan plugins) to pick up changes."
+log "Managers for future updates: Waves Central (installed), IK Product Manager (copied — run it in Wine and log in)."
+log "Toontrack/NeuralDSP/Melodyne/Pulsar: manual installers via bin/omadaw-vst install, then re-run this script."

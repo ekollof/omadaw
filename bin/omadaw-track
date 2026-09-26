@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# omadaw-track — exclusive low-latency "tracking mode" for guitar/bass.
+#
+# Reaper on PulseAudio (desktop mode) costs ~75ms — fine for mixing, useless
+# for monitored guitar. Tracking mode stops PipeWire and gives Reaper the
+# interface exclusively via bare ALSA (~2.6/5.3ms @ 128 frames on a UMC404HD).
+# Desktop audio (browser, notifications) pauses while tracking is on.
+#
+#   omadaw-track on [--device hw:CARD]  # enter tracking mode (default: first USB capture card)
+#   omadaw-track off                    # back to desktop (PipeWire + Reaper on PulseAudio)
+#   omadaw-track status                 # which mode, backend, clock
+set -euo pipefail
+
+BACKUP=~/.config/REAPER/reaper.ini.omadaw-desktop
+log()  { printf '[omadaw-track] %s\n' "$*"; }
+warn() { printf '[omadaw-track:warn] %s\n' "$*" >&2; }
+die()  { printf '[omadaw-track:error] %s\n' "$*" >&2; exit 1; }
+
+detect_card() {
+  # First USB ALSA card with capture channels, as hw:NAME (stable across boots).
+  local line name
+  line="$(arecord -l 2>/dev/null | grep -m1 "^card [0-9]")" || die "no ALSA capture device found"
+  name="$(grep -m1 "^\s*card $(echo "$line" | sed 's/^card \([0-9]*\).*/\1/') \[" /proc/asound/cards 2>/dev/null | sed 's/.*\[\(.*\)\].*/\1/' | tr -d ' ')"
+  [[ -n ${name:-} ]] || die "could not resolve ALSA card name"
+  echo "hw:$name"
+}
+
+quit_reaper() {
+  pgrep -x reaper >/dev/null || return 0
+  log "Asking Reaper to quit (save dialog protects unsaved work)…"
+  pkill -TERM -x reaper
+  for _ in $(seq 1 10); do
+    pgrep -x reaper >/dev/null || return 0
+    sleep 1
+  done
+  die "Reaper is still running (finish the save dialog?) — aborting, nothing changed"
+}
+
+cmd_on() {
+  local dev="${1:-}"
+  [[ -z $dev ]] && dev="$(detect_card)"
+  log "Tracking device: $dev"
+  quit_reaper
+  # Stash the desktop config so `off` restores it exactly.
+  if grep -q "^linux_audio_mode=3" ~/.config/REAPER/reaper.ini 2>/dev/null; then
+    cp ~/.config/REAPER/reaper.ini "$BACKUP"
+  fi
+  log "Stopping PipeWire (frees $dev for exclusive access)…"
+  systemctl --user stop pipewire-pulse.socket pipewire.socket \
+    pipewire-pulse.service pipewire.service wireplumber.service 2>/dev/null || true
+  sleep 1
+  if fuser /dev/snd/pcm* >/dev/null 2>&1; then
+    warn "Audio hardware still held — restarting desktop stack, aborting"
+    cmd_off >/dev/null 2>&1 || true
+    die "could not free the interface (see: fuser /dev/snd/pcm*)"
+  fi
+  sed -i -E "s/^(alsa_indev|alsa_outdev)=.*$/\1=$dev/; s/^linux_audio_mode=.*$/linux_audio_mode=1/; s/^linux_audio_bsize=.*$/linux_audio_bsize=128/; s/^linux_audio_srate=.*$/linux_audio_srate=48000/" \
+    ~/.config/REAPER/reaper.ini
+  log "Launching Reaper on bare ALSA ($dev)…"
+  setsid nohup reaper >/tmp/omadaw-track-reaper.log 2>&1 < /dev/null &
+  disown 2>/dev/null || true
+  sleep 8
+  pgrep -x reaper >/dev/null || die "Reaper died on $dev — see /tmp/omadaw-track-reaper.log; run: omadaw-track off"
+  log "TRACKING MODE ON — Reaper holds $dev exclusively. Check the title bar"
+  log "for the readout (want ~2-6ms, e.g. [48kHz 24bit WAV : 2/2ch 128spls ~2.6/5.3ms ALSA])."
+  log "Desktop audio is paused. Exit with: omadaw-track off"
+}
+
+cmd_off() {
+  quit_reaper
+  if [[ -f $BACKUP ]]; then
+    cp "$BACKUP" ~/.config/REAPER/reaper.ini
+    log "Restored desktop Reaper config"
+  else
+    sed -i -E "s/^linux_audio_mode=.*$/linux_audio_mode=3/" ~/.config/REAPER/reaper.ini 2>/dev/null || true
+  fi
+  log "Restarting PipeWire…"
+  systemctl --user start pipewire.socket pipewire-pulse.socket 2>/dev/null || true
+  systemctl --user start pipewire wireplumber pipewire-pulse 2>/dev/null || true
+  sleep 2
+  pgrep -x pipewire >/dev/null && log "DESKTOP MODE — PipeWire up ($(pw-metadata -n settings 2>/dev/null | grep -oE "clock.quantum' value:'[0-9]+'" || echo '?'))" \
+    || die "PipeWire did not come back — try: systemctl --user restart pipewire pipewire-pulse wireplumber"
+}
+
+cmd_status() {
+  if pgrep -x pipewire >/dev/null; then
+    echo "stack: desktop (PipeWire running, quantum $(pw-metadata -n settings 2>/dev/null | grep -oE "value:'[0-9]+'" | head -1))"
+  else
+    echo "stack: TRACKING (PipeWire stopped, interface exclusive)"
+  fi
+  if pgrep -x reaper >/dev/null; then
+    echo "reaper: running (backend: $(grep -E '^(linux_audio_mode|alsa_outdev)' ~/.config/REAPER/reaper.ini 2>/dev/null | tr '\n' ' '))"
+  else
+    echo "reaper: not running"
+  fi
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  on) dev=""; [[ "${1:-}" == "--device" ]] && { dev="${2:?}"; shift 2; }; cmd_on "$dev" "$@" ;;
+  off) cmd_off "$@" ;;
+  status) cmd_status "$@" ;;
+  help|--help|-h|*) sed -n '2,10p' "$0" ;;
+esac

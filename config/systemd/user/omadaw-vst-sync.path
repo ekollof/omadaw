@@ -1,0 +1,12 @@
+# OmaDAW VST auto-discovery — watches plugin dirs, triggers a yabridge sync.
+[Unit]
+Description=OmaDAW: re-sync yabridge when Windows VST files change
+
+[Path]
+PathChanged=%h/.wine-omadaw/drive_c/Program Files/Common Files/VST3
+PathChanged=%h/.wine-omadaw/drive_c/Program Files/Steinberg/VstPlugins
+PathChanged=%h/.vst
+PathChanged=%h/.vst3
+
+[Install]
+WantedBy=default.target

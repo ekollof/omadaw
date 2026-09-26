@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+# omadaw — prepare this Omarchy system for low-latency audio DAW usage, and
+# drop into the default agent harness (with repo skills in context) on request.
+#
+# Usage:
+#   ./omadaw [--yes] [--profile studio|balanced|safe]
+#            [--with-daw bitwig,reaper,ardour|all|none]
+#            [--wine-prefix PATH] [--snapshot] [--agent [extra prompt...]] [--check]
+#   ./omadaw doctor            # health check (idempotent, read-only; same as --check)
+#   ./omadaw agent ["goal"]    # launch default agent harness in this repo
+#
+# Idempotent: safe to re-run. Uses `omarchy pkg ...` helpers when available
+# so agents and humans get the same behaviour (see AGENTS.md).
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROFILE="studio"
+WITH_DAW="all"
+WINE_PREFIX="${WINEPREFIX:-$HOME/.wine-omadaw}"
+ASSUME_YES=false
+CHECK_ONLY=false
+TAKE_SNAPSHOT=false
+USE_AGENT=false
+AGENT_EXTRA=""
+AGENT_MANAGE=false
+
+log()  { printf '\033[1;32m[omadaw]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[omadaw:warn]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[omadaw:error]\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  echo "Usage:"
+  echo "  ./omadaw [--yes] [--profile studio|balanced|safe]"
+  echo "           [--with-daw bitwig,reaper,ardour|all|none]"
+  echo "           [--wine-prefix PATH] [--snapshot] [--agent [extra prompt...]] [--check]"
+  echo "  ./omadaw doctor            # health check (read-only, idempotent)"
+  echo "  ./omadaw agent [\"goal\"]    # default agent harness, repo skills in context"
+  echo "  --snapshot snapshots system + user state first (rollback: bin/omadaw-snapshot)."
+}
+
+launch_agent() {
+  # $1 = goal description. Runs IN this repo so AGENTS.md + skills/ are context.
+  local goal="$1"
+  if ! have omarchy; then
+    die "agent mode needs Omarchy (omarchy agent prompt not found)"
+  fi
+  local agent
+  agent="$(omarchy-default-agent 2>/dev/null || true)"
+  if [[ -z $agent ]]; then
+    die "No default agent set. Run: omarchy default agent <name>  (e.g. opencode, claude, codex, grok)"
+  fi
+  log "Launching OmaDAW agent ($agent) with repo context: $REPO_DIR"
+  local prompt="You are in the OmaDAW repo at $REPO_DIR. Follow AGENTS.md and skills/omadaw-audio/SKILL.md. Goal: $goal"
+  # shellcheck disable=SC2086
+  exec omarchy agent prompt $prompt
+}
+
+# Subcommand pre-dispatch (actions run after helpers, below).
+# omadaw itself owns privileged/package steps; the agent owns decisions
+# that benefit from inspection (interface quirks, DAW choice, VST inventory).
+AGENT_MANAGE=false
+if [[ "${1:-}" == "agent" ]]; then
+  shift
+  USE_AGENT=true
+  AGENT_MANAGE=true
+  AGENT_EXTRA="Manage this OmaDAW audio setup: check health with ./omadaw doctor, fix what is broken per skills/omadaw-audio/SKILL.md and skills/omadaw-vst/SKILL.md, then report status. $*"
+  set --
+elif [[ "${1:-}" == "doctor" ]]; then
+  shift
+  CHECK_ONLY=true
+fi
+
+while (($#)); do
+  case "$1" in
+    --yes) ASSUME_YES=true; shift ;;
+    --profile) PROFILE="${2:?--profile needs studio|balanced|safe}"; shift 2 ;;
+    --with-daw) WITH_DAW="${2:?--with-daw needs a value}"; shift 2 ;;
+    --wine-prefix) WINE_PREFIX="$2"; shift 2 ;;
+    --snapshot) TAKE_SNAPSHOT=true; shift ;;
+    --agent) USE_AGENT=true; shift; AGENT_EXTRA="$*"; break ;;
+    --check) CHECK_ONLY=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown flag: $1 (see --help)" ;;
+  esac
+done
+
+case "$PROFILE" in
+  studio|balanced|safe) ;;
+  *) die "--profile must be studio, balanced or safe" ;;
+esac
+
+# ---------------------------------------------------------------- helpers ---
+have() { command -v "$1" >/dev/null 2>&1; }
+
+pkg_add() {
+  # Prefer Omarchy helpers so AUR/pacman policy stays in one place.
+  if have omarchy; then
+    omarchy pkg add "$@"
+  else
+    sudo pacman -S --needed "$@"
+  fi
+}
+
+aur_add() {
+  if have omarchy; then
+    omarchy pkg aur add "$@"
+  elif have yay; then
+    yay -S --needed "$@"
+  elif have paru; then
+    paru -S --needed "$@"
+  else
+    die "Need an AUR helper for $*: install yay/paru or run via Omarchy (omarchy pkg aur add)"
+  fi
+}
+
+confirm() {
+  $ASSUME_YES && return 0
+  read -r -p "[omadaw] $1 [y/N] " ans
+  [[ $ans == [yY]* ]]
+}
+
+# ------------------------------------------------- agent delegation mode ---
+# omadaw itself owns privileged/package steps; the agent owns decisions
+# that benefit from inspection (interface quirks, DAW choice, VST inventory).
+if $USE_AGENT; then
+  if $AGENT_MANAGE; then
+    launch_agent "$AGENT_EXTRA"
+  else
+    launch_agent "Set up this Omarchy machine for low-latency audio production (profile=$PROFILE, daws=$WITH_DAW, wine-prefix=$WINE_PREFIX). Plan: 1) run ./omadaw --profile $PROFILE --with-daw $WITH_DAW --wine-prefix $WINE_PREFIX --yes for the deterministic base, 2) inspect 'wpctl status' + 'pw-metadata -n settings' and tune quantum/rate if the interface needs it, 3) configure the requested DAWs per config/daw/, 4) run bin/omadaw-vst doctor and report VST status. Ask before installing a paid DAW (Bitwig) if it is not already licensed/installed. $AGENT_EXTRA"
+  fi
+fi
+
+# ------------------------------------------------------------ package sets ---
+BASE_PKGS=(realtime-privileges rtkit pipewire pipewire-alsa pipewire-pulse
+  pipewire-jack wireplumber alsa-utils
+  yabridge yabridgectl wine-staging winetricks
+  qpwgraph lsp-plugins carla)
+# helvum is a lighter alternative to qpwgraph; qpwgraph is the default pick.
+DAW_PKGS_reaper=(reaper)
+DAW_PKGS_ardour=(ardour)
+DAW_AUR_bitwig=(bitwig-studio)
+
+resolve_daws() {
+  local sel="$1"
+  if [[ $sel == "none" ]]; then return 0; fi
+  if [[ $sel == "all" ]]; then sel="reaper,ardour,bitwig"; fi
+  echo "$sel" | tr ',' ' '
+}
+
+# ------------------------------------------------------------------ check ---
+do_check() {
+  local fail=0
+  check() {
+    if eval "$2"; then log "ok: $1"; else warn "MISSING: $1"; fail=1; fi
+  }
+  check "realtime-privileges installed" "pacman -Q realtime-privileges >/dev/null 2>&1"
+  check "user in realtime group" "id -nG | tr ' ' '\n' | grep -qx realtime"
+  check "rtkit running" "systemctl --user is-active --quiet rtkit-daemon 2>/dev/null || systemctl is-active --quiet rtkit-daemon 2>/dev/null"
+  check "pipewire running" "pgrep -x pipewire >/dev/null"
+  check "wireplumber running" "pgrep -x wireplumber >/dev/null"
+  check "pipewire-jack present" "pacman -Q pipewire-jack >/dev/null 2>&1"
+  check "omadaw pipewire config" "test -f ~/.config/pipewire/pipewire.conf.d/10-omadaw.conf"
+  check "wine prefix $WINE_PREFIX" "test -d '$WINE_PREFIX/drive_c'"
+  check "yabridge installed" "pacman -Q yabridge >/dev/null 2>&1"
+  check "yabridgectl installed" "have yabridgectl"
+  "$REPO_DIR/bin/omadaw-vst" doctor || fail=1
+  return $fail
+}
+
+if $CHECK_ONLY; then
+  do_check
+  exit $?
+fi
+
+log "OmaDAW setup: profile=$PROFILE daws=$WITH_DAW wine-prefix=$WINE_PREFIX"
+
+if ${TAKE_SNAPSHOT:-false}; then
+  log "0/5 pre-install snapshot (rollback: bin/omadaw-snapshot rollback-system + rollback-user latest)"
+  WINEPREFIX="$WINE_PREFIX" "$REPO_DIR/bin/omadaw-snapshot" pre-install
+fi
+
+# ------------------------------------------------------- 1. realtime audio ---
+log "1/6 realtime privileges (realtime-privileges + rtkit, user -> realtime group)"
+pkg_add "${BASE_PKGS[@]}"
+if ! id -nG | tr ' ' '\n' | grep -qx realtime; then
+  log "Adding $USER to realtime group (takes effect on next login)"
+  sudo usermod -aG realtime "$USER" || warn "could not add $USER to realtime group"
+else
+  log "User already in realtime group"
+fi
+# rtkit is socket-activated; ensure the system service is enabled where present.
+sudo systemctl enable --now rtkit-daemon 2>/dev/null || systemctl --user enable --now rtkit-daemon 2>/dev/null || true
+if [[ -f /etc/security/limits.d/99-realtime-privileges.conf ]]; then
+  log "rt limits installed:"
+  cat /etc/security/limits.d/99-realtime-privileges.conf
+else
+  warn "limits file not found — realtime-privileges may need a reinstall or relogin"
+fi
+
+# ------------------------------------------------------- 2. pipewire tuning ---
+log "2/6 PipeWire low-latency profile: $PROFILE"
+mkdir -p ~/.config/pipewire/pipewire.conf.d
+cp "$REPO_DIR/config/pipewire/pipewire.conf.d/10-omadaw-${PROFILE}.conf" \
+   ~/.config/pipewire/pipewire.conf.d/10-omadaw.conf
+log "Wrote ~/.config/pipewire/pipewire.conf.d/10-omadaw.conf ($PROFILE)"
+if confirm "Restart pipewire + wireplumber now to apply quantum/rate?"; then
+  systemctl --user restart pipewire pipewire-pulse wireplumber || warn "restart failed — relogin will apply it"
+  sleep 1
+  pw-metadata -n settings 2>/dev/null | grep -E "clock.(rate|quantum)" || true
+fi
+
+# ------------------------------------------- 3. interface profiles (pro-audio) ---
+# Multichannel USB interfaces must use the Pro Audio profile or DAWs see the
+# wrong channel count. Only duplex USB cards qualify (webcams/HDMI are left
+# alone). WirePlumber remembers the choice per device across reboots.
+log "3/6 interface profiles (Pro Audio for duplex USB interfaces)"
+mapfile -t _cards < <("$REPO_DIR/bin/omadaw-route" duplex-usb-cards)
+for _card in "${_cards[@]:-}"; do
+  [[ -n $_card ]] || continue
+  if confirm "Set $_card to Pro Audio (all channels visible to DAWs)?"; then
+    pactl set-card-profile "$_card" pro-audio || warn "could not set Pro Audio on $_card"
+  else
+    log "Leaving $_card as-is (set later: bin/omadaw-route set-profile <card> pro-audio)"
+  fi
+done
+unset _cards _card
+
+# ------------------------------------------------------- 4. wine/vst prefix ---
+log "4/6 dedicated Wine prefix for VSTs: $WINE_PREFIX"
+export WINEPREFIX="$WINE_PREFIX"
+export WINEDEBUG="${WINEDEBUG:--all}"
+mkdir -p "$WINE_PREFIX"
+if [[ ! -d $WINE_PREFIX/drive_c ]]; then
+  log "Initializing prefix (wineboot --init)…"
+  wineboot --init
+fi
+wine --version
+# Standard Steinberg-style plugin homes inside the prefix.
+mkdir -p "$WINE_PREFIX/drive_c/Program Files/Steinberg/VstPlugins" \
+         "$WINE_PREFIX/drive_c/Program Files/Common Files/VST3" \
+         "$WINE_PREFIX/drive_c/Program Files/Common Files/CLAP" \
+         ~/.vst ~/.vst3 ~/.clap
+"$REPO_DIR/bin/omadaw-vst" init --prefix "$WINE_PREFIX" || warn "omadaw-vst init reported issues (see above)"
+
+# ----------------------------------------------------------------- 4. DAWs ---
+log "5/6 DAWs ($WITH_DAW)"
+for daw in $(resolve_daws "$WITH_DAW"); do
+  case "$daw" in
+    reaper) pkg_add "${DAW_PKGS_reaper[@]}" ;;
+    ardour) pkg_add "${DAW_PKGS_ardour[@]}" ;;
+    bitwig)
+      if confirm "Install Bitwig Studio from AUR (large, proprietary; needs license)?"; then
+        aur_add "${DAW_AUR_bitwig[@]}"
+      else
+        log "Skipping bitwig (re-run with --with-daw bitwig to add later)"
+      fi
+      ;;
+    *) warn "Unknown DAW '$daw' — want reaper, ardour, bitwig, all or none" ;;
+  esac
+done
+"$REPO_DIR/bin/omadaw-route" setup-daw-config || warn "DAW config hints failed (non-fatal)"
+# Match Reaper's channel counts to the default interface (e.g. 4ch on a UMC404HD).
+# Never fails the install (headless boxes may have no defaults yet).
+if command -v reaper >/dev/null 2>&1; then
+  "$REPO_DIR/bin/omadaw-route" set-channels reaper || log "Channel auto-match skipped — run later: bin/omadaw-route set-channels reaper"
+fi
+# Seed Reaper's PulseAudio backend (pure PipeWire) when it has no audio choice
+# yet. Never overwrites an existing selection. A later SIGKILL with no
+# coredump is RLIMIT_RTTIME from rtkit when this session's ulimit -r is 0;
+# the user must reboot or relogin. See config/daw/reaper.md.
+if command -v reaper >/dev/null 2>&1; then
+  _rini=~/.config/REAPER/reaper.ini
+  if [[ ! -f $_rini ]] || ! grep -q "^linux_audio_mode=" "$_rini"; then
+    mkdir -p ~/.config/REAPER
+    [[ -f $_rini ]] || printf '[reaper]\n' > "$_rini"
+    printf 'linux_audio_mode=3\nlinux_audio_srate=48000\n' >> "$_rini"
+    log "Seeded Reaper PulseAudio backend (linux_audio_mode=3 @ 48 kHz)"
+  fi
+  unset _rini
+fi
+
+# ------------------------------------------------------- 5. discovery unit ---
+log "6/6 VST auto-discovery (systemd user path unit)"
+if confirm "Enable background VST discovery (re-syncs yabridge when new .dll/.vst3 appear)?"; then
+  "$REPO_DIR/bin/omadaw-vst" enable-watch || warn "could not enable watch unit"
+else
+  log "Skipping watch unit — run: bin/omadaw-vst enable-watch"
+fi
+
+echo
+log "Done. Next steps:"
+echo "  - Reboot (or log out and back in) if this session was started before joining the realtime group."
+echo "    Check: id    # must list realtime without passing your username; ulimit -r must print 98."
+echo "    A logout that leaves systemd --user running does not apply the group; reboot does."
+echo "  - Check: ./omadaw --check"
+echo "  - Install a Windows VST: bin/omadaw-vst install ~/Downloads/SomePluginSetup.exe"
+echo "  - Sync bridges: bin/omadaw-vst sync"
+echo "  - Patchbay: qpwgraph (or bin/omadaw-route status)"
+echo "  - Agent-driven tune-up: ./omadaw --agent \"use my USB interface at 128 frames\""

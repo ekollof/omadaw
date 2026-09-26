@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# omadaw-route — PipeWire routing + DAW launch helpers.
+#
+#   omadaw-route status                 # sinks, sources, quantum/rate, xruns hint
+#   omadaw-route interfaces             # list ALL audio devices (any count, any vendor)
+#   omadaw-route set-default <sink|source> <name-or-id>  # pick one (see interfaces)
+#   omadaw-route profiles               # show card profiles (Pro Audio etc.)
+#   omadaw-route set-profile <card> <profile>  # e.g. set-profile UMC404HD pro-audio
+#   omadaw-route profile <studio|balanced|safe>   # switch latency profile live
+#   omadaw-route launch <bitwig|reaper|ardour> [args...]  # DAW launcher
+#   omadaw-route setup-daw-config       # write VST path hints + DAW backend notes
+#   omadaw-route set-channels reaper [--in N] [--out M]  # match DAW ch to interface
+#   omadaw-route save <file>|restore <file>  # qpwgraph patch snapshot helpers
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+log() { printf '[omadaw-route] %s\n' "$*"; }
+warn() { printf '[omadaw-route:warn] %s\n' "$*" >&2; }
+die() { printf '[omadaw-route:error] %s\n' "$*" >&2; exit 1; }
+
+cmd_status() {
+  echo "== clock =="
+  pw-metadata -n settings 2>/dev/null | grep -E "clock.(rate|quantum|allowed-rates)" || echo "(no pw-metadata — is pipewire running?)"
+  echo "== sinks/sources =="
+  wpctl status 2>/dev/null | sed -n '/Audio/,/Streams/p' | head -n 40 || wpctl status | head -n 40
+  echo "== rt =="
+  id -nG | tr ' ' '\n' | grep -qx realtime && echo "realtime group: yes (ulimit -r $(ulimit -r))" || echo "realtime group: NO — tell the user to reboot or relogin (ulimit -r is $(ulimit -r); want 98)"
+  echo "== DAWs =="
+  for d in bitwig-studio reaper ardour; do
+    command -v "$d" >/dev/null 2>&1 && echo "  $d: installed" || echo "  $d: not installed"
+  done
+}
+
+cmd_interfaces() {
+  # Generic enumeration: never assumes a specific interface or count.
+  # Prints every PipeWire device + sink/source with IDs usable by set-default.
+  wpctl status 2>/dev/null | awk '
+    /Devices:/,/Sinks:/    { print "device: " $0 }
+    /Sinks:/,/Sources:/    { print "sink:   " $0 }
+    /Sources:/,/Filters:/  { print "source: " $0 }
+  ' | grep -E "device:|sink:|source:" | grep -E "[0-9]+\." || wpctl status
+  echo
+  echo "Set one with: omadaw-route set-default <sink|source> <id-or-name>"
+}
+
+cmd_set_default() {
+  [[ $# -eq 2 ]] || die "usage: omadaw-route set-default <sink|source> <name-or-id>  (see: omadaw-route interfaces)"
+  case "$1" in
+    sink) wpctl set-default "$2" ;;
+    source) wpctl set-default "$2" ;;
+    *) die "first arg must be sink or source" ;;
+  esac
+  if command -v omarchy >/dev/null 2>&1; then
+    log "tip: Omarchy also exposes this via: omarchy audio output switch / omarchy audio source switch"
+  fi
+}
+
+cmd_profiles() {
+  # Human-readable card list: index, name, active profile, pro-audio availability.
+  pactl list cards 2>/dev/null | grep -E "^(Card #|	Name: |	Active Profile: )|pro-audio: " ||
+    die "pactl not available — is pipewire-pulse running?"
+}
+
+# Resolve a card selector (numeric index or Name/description substring) to a card index.
+resolve_card() {
+  local sel="$1" id
+  if [[ $sel =~ ^[0-9]+$ ]] && pactl list cards 2>/dev/null | grep -q "^Card #$sel$"; then
+    echo "$sel"; return 0
+  fi
+  id="$(pactl list cards 2>/dev/null | awk -v pat="$sel" '/^Card #/ {id=$3} /Name: / && index($0, pat) {print id; exit}')"
+  [[ -n ${id:-} ]] || die "no card matches '$sel' (see: omadaw-route profiles)"
+  echo "$id"
+}
+
+cmd_set_profile() {
+  [[ $# -eq 2 ]] || die "usage: omadaw-route set-profile <card-id-or-name> <profile>  (see: omadaw-route profiles)"
+  local card
+  card="$(resolve_card "$1")"
+  pactl set-card-profile "$card" "$2" && log "card $card -> profile $2"
+}
+
+cmd_duplex_usb_cards() {
+  # Machine-readable: card NAMEs (one per line) for USB cards whose pro-audio
+  # profile has both sinks and sources — i.e. real duplex interfaces, not
+  # mics, webcams, or HDMI outputs. Used by omadaw.
+  local name="" trimmed sinks srcs rest
+  pactl list cards 2>/dev/null | while IFS= read -r line; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    case "$trimmed" in
+      "Name: alsa_card.usb-"*) name="${trimmed#Name: }" ;;
+      "Name: "*) name="" ;;
+      "pro-audio: Pro Audio ("*)
+        rest="${trimmed#*\(sinks: }"; sinks="${rest%%,*}"
+        rest="${trimmed#*sources: }"; srcs="${rest%%,*}"
+        if [[ -n $name && ${sinks:-0} -gt 0 && ${srcs:-0} -gt 0 ]]; then echo "$name"; fi
+        name="" ;;
+    esac
+  done
+}
+
+cmd_profile() {  [[ $# -eq 1 ]] || die "usage: omadaw-route profile <studio|balanced|safe>"
+  local src="$REPO_DIR/config/pipewire/pipewire.conf.d/10-omadaw-$1.conf"
+  [[ -f $src ]] || die "unknown profile $1"
+  mkdir -p ~/.config/pipewire/pipewire.conf.d
+  cp "$src" ~/.config/pipewire/pipewire.conf.d/10-omadaw.conf
+  log "profile $1 installed — restarting pipewire…"
+  systemctl --user restart pipewire pipewire-pulse wireplumber
+  sleep 1
+  pw-metadata -n settings 2>/dev/null | grep -E "clock.(rate|quantum)" || true
+}
+
+cmd_launch() {
+  [[ $# -ge 1 ]] || die "usage: omadaw-route launch <bitwig|reaper|ardour> [args...]"
+  local daw="$1"; shift
+  case "$daw" in
+    bitwig) exec bitwig-studio "$@" ;;
+    reaper) exec reaper "$@" ;;
+    ardour) exec ardour "$@" ;;
+    *) die "unknown daw $daw (bitwig|reaper|ardour)" ;;
+  esac
+}
+
+cmd_setup_daw_config() {
+  # DAWs auto-scan these Linux paths; yabridge shims live here after sync.
+  # We only write hint files + print backend guidance (never overwrite DAW configs).
+  mkdir -p ~/.vst ~/.vst3 ~/.clap ~/.lv2
+  cat > ~/.config/omadaw-vst-paths.env <<'EOF'
+# Sourced by DAW launchers / documented in config/daw/*.md
+VST_PATH=$HOME/.vst:$HOME/.vst/yabridge
+VST3_PATH=$HOME/.vst3
+CLAP_PATH=$HOME/.clap
+EOF
+  log "VST scan paths (ensure these are in your DAW settings):"
+  echo "  VST2: ~/.vst  (+ ~/.vst/yabridge shims)"
+  echo "  VST3: ~/.vst3"
+  echo "  CLAP: ~/.clap   LV2: ~/.lv2"
+  log "Backend guidance: Reaper/Ardour -> JACK (PipeWire) or ALSA; Bitwig -> ALSA or JACK. Details: config/daw/*.md"
+}
+
+cmd_set_channels() {
+  # Match a DAW's channel counts to the current default interface, e.g.
+  #   omadaw-route set-channels reaper                 # auto-detect in/out
+  #   omadaw-route set-channels reaper --in 4 --out 2  # explicit
+  # Currently supports reaper (linux_audio_nch_in/out in ~/.config/REAPER/reaper.ini).
+  # omadaw calls this automatically; agents can re-run it after changing interfaces.
+  [[ $# -ge 1 ]] || die "usage: omadaw-route set-channels reaper [--in N] [--out M]"
+  [[ $1 == "reaper" ]] || die "set-channels currently supports only: reaper"
+  shift
+  local want_in="" want_out=""
+  while (($#)); do
+    case "$1" in
+      --in) want_in="$2"; shift 2 ;;
+      --out) want_out="$2"; shift 2 ;;
+      *) die "unknown flag $1 (want --in N / --out M)" ;;
+    esac
+  done
+  if [[ -z $want_in || -z $want_out ]]; then
+    command -v jq >/dev/null 2>&1 || die "need jq for channel detection (omarchy pkg add jq)"
+    local dump src sink
+    dump="$(mktemp)"
+    pw-dump > "$dump" 2>/dev/null || die "pw-dump failed — is pipewire running?"
+    src="$(pactl get-default-source 2>/dev/null)" || { rm -f "$dump"; die "no default source (see: omadaw-route interfaces)"; }
+    sink="$(pactl get-default-sink 2>/dev/null)" || { rm -f "$dump"; die "no default sink (see: omadaw-route interfaces)"; }
+    [[ -z $want_in ]] && want_in="$(jq --arg n "$src" '[.[] | select(.type=="PipeWire:Interface:Node") | select(.info.props["node.name"]==$n) | .id] as $ids | [.[] | select(.type=="PipeWire:Interface:Port") | select(.info.props["node.id"] as $nid | ($ids | index($nid)) != null) | select(.info.props["port.direction"]=="out")] | length' "$dump")"
+    [[ -z $want_out ]] && want_out="$(jq --arg n "$sink" '[.[] | select(.type=="PipeWire:Interface:Node") | select(.info.props["node.name"]==$n) | .id] as $ids | [.[] | select(.type=="PipeWire:Interface:Port") | select(.info.props["node.id"] as $nid | ($ids | index($nid)) != null) | select(.info.props["port.direction"]=="in")] | length' "$dump")"
+    rm -f "$dump"
+    log "detected from defaults ($src / $sink): in=$want_in out=$want_out"
+  fi
+  [[ $want_in -gt 0 && $want_out -gt 0 ]] || die "detection found in=$want_in out=$want_out — pass explicit --in/--out"
+  local ini=~/.config/REAPER/reaper.ini old_in old_out
+  [[ -f $ini ]] || die "no $ini yet — launch Reaper once first"
+  old_in="$(grep -E "^linux_audio_nch_in=" "$ini" | cut -d= -f2)"
+  old_out="$(grep -E "^linux_audio_nch_out=" "$ini" | cut -d= -f2)"
+  if [[ $old_in == "$want_in" && $old_out == "$want_out" ]]; then
+    log "Reaper channels already in=$want_in out=$want_out — nothing to do"
+    return 0
+  fi
+  sed -i -E "s/^linux_audio_nch_in=.*$/linux_audio_nch_in=$want_in/; s/^linux_audio_nch_out=.*$/linux_audio_nch_out=$want_out/" "$ini"
+  log "Reaper channels: in ${old_in:-?}->${want_in}, out ${old_out:-?}->${want_out}"
+  if pgrep -x reaper >/dev/null; then
+    warn "Reaper is running — restart it for the new channel counts (ports in1..in$want_in appear)"
+  fi
+}
+
+cmd_save() {  [[ $# -eq 1 ]] || die "usage: omadaw-route save <patch-file>"
+  if command -v qpwgraph >/dev/null 2>&1; then
+    log "Open qpwgraph and save your patch to: $1 (qpwgraph owns the format; this just reminds you where)"
+  else
+    warn "qpwgraph not installed — run ./omadaw, then save patches manually"
+  fi
+  pw-dump > "$1"
+  log "Raw pw-dump snapshot saved to $1"
+}
+
+cmd_restore() {
+  log "PipeWire restores connections itself; use qpwgraph 'Activate patchbay' for saved patches."
+  log "Raw snapshot (informational): ${1:-<none>}"
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  status) cmd_status "$@" ;;
+  interfaces|devices) cmd_interfaces "$@" ;;
+  set-default) cmd_set_default "$@" ;;
+  profiles) cmd_profiles "$@" ;;
+  set-profile) cmd_set_profile "$@" ;;
+  duplex-usb-cards) cmd_duplex_usb_cards "$@" ;;
+  profile) cmd_profile "$@" ;;
+  launch) cmd_launch "$@" ;;
+  setup-daw-config) cmd_setup_daw_config "$@" ;;
+  set-channels) cmd_set_channels "$@" ;;
+  save) cmd_save "$@" ;;
+  restore) cmd_restore "$@" ;;
+  help|--help|-h|*) sed -n '2,12p' "$0" ;;
+esac
