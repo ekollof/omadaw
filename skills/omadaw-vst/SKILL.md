@@ -293,3 +293,17 @@ T-RackS suite shell spam activation popups at scan). Copy only as scaffolding
 
   Do not downgrade `wine-staging` to 9.21 to chase this; this prefix is on
   11.17 for the rest of the stack.
+
+- **JUCE plugin GUI draws but never updates** (verified 2026-09-26, IK
+  Multimedia TONEX under yabridge-git and Wine 11.17). Clicks can land and
+  the audio can change while the editor stays frozen. That is WineD3D not
+  redrawing the JUCE surface. Install DXVK into the prefix and reopen the
+  plugin so `yabridge-host.exe` starts again:
+
+  ```bash
+  WINEPREFIX=~/.wine-omadaw winetricks -q dxvk
+  ```
+
+  That copies native `d3d11.dll` and `dxgi.dll` into the prefix and sets
+  `HKCU\Software\Wine\DllOverrides` to `native`. The already-running host
+  keeps WineD3D until the editor is closed and opened again.
