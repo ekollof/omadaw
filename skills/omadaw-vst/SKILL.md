@@ -306,4 +306,106 @@ T-RackS suite shell spam activation popups at scan). Copy only as scaffolding
 
   That copies native `d3d11.dll` and `dxgi.dll` into the prefix and sets
   `HKCU\Software\Wine\DllOverrides` to `native`. The already-running host
-  keeps WineD3D until the editor is closed and opened again.
+  keeps WineD3D until the editor is closed and opened again. DXVK is
+  prefix-wide, so every later `yabridge-host.exe` uses it. A plugin that
+  is already open stays on WineD3D until that host process starts again.
+
+- **Dropdowns are separate Hyprland windows** (verified 2026-09-26, Hyprland
+  0.56, XWayland, yabridge-git `5.1.1.r57`). yabridge does not draw the menu
+  inside the plugin surface. Each Win32 popup is its own floating XWayland
+  client: class `yabridge-host.exe`, title `menu`. Hyprland then runs its
+  open animation on it. The white frame is not a title bar. It is Hyprland's
+  2px border plus four empty-titled strips (about 12px) that sit on the
+  menu's edges. The pointer jumps onto a child menu because Hyprland warps
+  on focus, and it sticks because Wine grabs the pointer.
+
+  Edit the user Hyprland config (`~/.config/hypr/`, Omarchy's `o.window`
+  helper). Do not edit `/usr/share/omarchy/`. Afterward run `hyprctl reload`
+  and `hyprctl configerrors`.
+
+  ```lua
+  -- ~/.config/hypr/looknfeel.lua
+  hl.config({
+    cursor = {
+      no_warps = true,
+      warp_on_change_workspace = 2,
+    },
+  })
+  ```
+
+  ```lua
+  -- ~/.config/hypr/hyprland.lua
+  o.window({
+    class = "^yabridge-host\\.exe$",
+    xwayland = true,
+    float = true,
+  }, {
+    no_anim = true,
+    no_shadow = true,
+    no_blur = true,
+    no_dim = true,
+    decorate = false,
+    rounding = 0,
+    border_size = 0,
+    tag = "-default-opacity",
+    opacity = "1 override",
+  })
+
+  -- Wine closes a dropdown when the plugin editor stops being the active
+  -- window. Hyprland's focus passes through "nothing" on the way to the
+  -- menu, and that gap is enough. suppress_event "activatefocus" is the
+  -- real switch; a focus_on_activate field on the window rule is ignored.
+  o.window({
+    class = "^yabridge-host\\.exe$",
+    title = "^menu$",
+    xwayland = true,
+    float = true,
+  }, {
+    no_follow_mouse = true,
+    no_initial_focus = true,
+    suppress_event = "activatefocus",
+  })
+
+  o.window({
+    class = "^yabridge-host\\.exe$",
+    title = "^$",
+    xwayland = true,
+    float = true,
+  }, {
+    no_focus = true,
+    no_initial_focus = true,
+    no_follow_mouse = true,
+    suppress_event = "activatefocus",
+  })
+
+  o.window({
+    class = "^yabridge-host\\.exe$",
+    title = "^$",
+    xwayland = true,
+    float = true,
+  }, {
+    opacity = "0 override",
+  })
+  ```
+
+  Do not move those blank strips off-screen. yabridge treats the pointer
+  leaving the plugin window as a reason to drop keyboard focus
+  (`LeaveNotify` → `set_input_focus(false)`), and a dropdown closes when
+  that happens. Hiding the strips with `opacity = "0 override"` is enough.
+  `suppress_event = "activatefocus"` on title `menu` keeps the popup from
+  becoming the active window. A `focus_on_activate` field on the window
+  rule is ignored. The close is intermittent because Hyprland sometimes
+  drops focus to nothing while the menu is being mapped, and Wine treats
+  that as the editor going away.
+
+  Also stop Wine from grabbing the pointer. Reopen the plugin afterward so
+  `yabridge-host.exe` starts again:
+
+  ```bash
+  WINEPREFIX=~/.wine-omadaw wine reg add \
+    "HKCU\Software\Wine\X11 Driver" /v GrabPointer /t REG_SZ /d N /f
+  ```
+
+  Reaper's own windows stay class `REAPER` and are not matched. `no_warps`
+  does not stop workspace changes from moving the cursor when
+  `warp_on_change_workspace` is `2`.
