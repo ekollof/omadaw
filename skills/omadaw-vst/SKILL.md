@@ -6,7 +6,7 @@ description: >
   diagnose missing plugins). Use for any Windows-VST, yabridge, yabridgectl,
   Wine/Proton prefix, Waves Central, or plugin-scan task. Triggers: VST,
   yabridge, setup.exe, wine prefix, Waves, Waves Central, WaveShell,
-  plugin not showing in DAW, bridge sync.
+  Native Access, Service Center, plugin not showing in DAW, bridge sync.
 ---
 
 # OmaDAW VST Skill
@@ -229,6 +229,73 @@ T-RackS suite shell spam activation popups at scan). Copy only as scaffolding
   `bin/omadaw-vst run <exe> [args...]`). Login works, downloads install
   in-prefix. Download path may follow migrated settings into a second
   `drive_c/users/<name>` profile — harmless, leave it.
+- **Native Access** (Electron, verified 2026-09-27, wine-staging 11.17).
+  Service Center is retired. `servicecenter.native-instruments.com` resolves
+  and does not answer on port 443, and the old `/servicecenter/*.xml` URLs
+  are 404. Wine can still reach `www.native-instruments.com`. Activate in
+  Native Access (`Native-Access_2.exe`, NSIS, via `bin/omadaw-vst install`).
+  The app is `drive_c/Program Files/Native Instruments/Native Access/Native Access.exe`.
+  The login screen renders without the IK Product Manager GPU flags.
+
+  Login finishes in the **host** browser (`auth.native-instruments.com` →
+  `na-cloud.native-instruments.com/.../auth-handler`), then redirects to
+  `native-access://`. Wine registers that scheme
+  (`HKCU\Software\Classes\native-access` → `Native Access.exe`), and the
+  Linux browser does not, so the app stays on "Please log in" after a
+  successful sign-in. Register a user handler, then log in again:
+
+  ```bash
+  mkdir -p ~/.local/bin ~/.local/share/applications
+  cat > ~/.local/bin/native-access-url <<'EOF'
+  #!/bin/sh
+  # Electron crashes with open EBADF unless stderr is a pty.
+  export WINEPREFIX="${WINEPREFIX:-$HOME/.wine-omadaw}"
+  export WINEDEBUG="${WINEDEBUG:--all}"
+  export DISPLAY="${DISPLAY:-:0}"
+  export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}"
+  export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  export NA_URL="$1"
+  exec script -q -f -e -c \
+    'wine "C:\Program Files\Native Instruments\Native Access\Native Access.exe" "$NA_URL"' \
+    /tmp/native-access-url.typescript
+  EOF
+  chmod 755 ~/.local/bin/native-access-url
+  cat > ~/.local/share/applications/native-access-url.desktop <<EOF
+  [Desktop Entry]
+  Type=Application
+  Name=Native Access
+  NoDisplay=true
+  Exec=$HOME/.local/bin/native-access-url %u
+  MimeType=x-scheme-handler/native-access;
+  Terminal=false
+  EOF
+  update-desktop-database ~/.local/share/applications
+  xdg-mime default native-access-url.desktop x-scheme-handler/native-access
+  ```
+
+  A handler that runs `wine` directly, with stderr a pipe, shows "A JavaScript
+  error occurred in the main process": `open EBADF` in
+  `createWritableStdioStream` / `process.stderr`. Same failure as Waves
+  Central. `script -q -f -e -c` is required. After the handler is in place,
+  the existing "Signing in…" tab can be reopened; a fresh Login click also
+  works. Do not print the auth-handler URL. It carries the session token.
+
+  Guitar Rig 5 (verified 2026-09-27) then crashes on launch. The dialog names
+  `Documents\Native Instruments\Guitar Rig 5\Crashlogs\*-mini.nicrash`.
+  That file is a minidump, exception `0x80000100` (`EXCEPTION_WINE_STUB`) in
+  Wine's builtin `msvcr120.dll` for
+  `Concurrency::details::_AsyncTaskCollection::_NewCollection`. The VC++ 2013
+  concurrency runtime is not implemented. Install the native redist and
+  relaunch. Do not treat this as a missing ISO mount:
+
+  ```bash
+  WINEPREFIX=~/.wine-omadaw winetricks -q vcrun2013
+  ```
+
+  That sets `msvcr120`, `msvcp120`, `atl120`, and `vcomp120` to
+  `native,builtin`. The standalone then opens
+  (`Guitar Rig 5.exe`, window title `Guitar Rig 5 - Native Instruments`).
+
 - **Toontrack Product Manager** (Qt): renders natively, no flags needed.
   It stages installers under `~/Downloads/Toontrack/` (tens of GB for SDX
   libraries — watch disk; clean up after). Sound libraries land in
