@@ -17,7 +17,11 @@ Windows VSTs, and routing/config for Bitwig, Reaper, Ardour.
   `omarchy-default-agent`) with this repo as context. Use it when the task needs
   inspection (interface quirks, which DAWs, VST inventory).
 - **Diagnose first, then fix:**
-  `./omadaw --check` → `bin/omadaw-route status` → `bin/omadaw-vst doctor`.
+  `./omadaw doctor` → `bin/omadaw-route status` → `bin/omadaw-vst doctor`.
+  `doctor` fast-forwards this repo when the worktree is clean, reinstalls a
+  changed PipeWire profile and an already-enabled VST watch unit, and prints
+  any `AGENTS.md` or `skills/` files to re-read before acting. `./omadaw
+  --check` is the same health check without the fetch.
 - **Skills (load the matching one before acting):**
   - `skills/omadaw-audio/SKILL.md` — PipeWire quantum/rate, realtime group,
     DAW routing, xruns. Triggers: latency, xruns, no DAW sound, device routing.

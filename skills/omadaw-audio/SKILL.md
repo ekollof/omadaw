@@ -46,7 +46,7 @@ truth — do not rediscover package names or config paths from the web first.
 ### Diagnose (always start here)
 
 ```bash
-./omadaw --check
+./omadaw doctor
 bin/omadaw-route status
 pw-metadata -n settings | grep -E "clock.(rate|quantum)"
 wpctl status
@@ -75,7 +75,9 @@ systemctl --user status pipewire pipewire-pulse wireplumber --no-pager
      (`linux_audio_mode=3`) is the high-latency desktop path. A SIGKILL
      with no coredump is the realtime-limit failure in step 1, not a reason
      to abandon JACK. See `config/daw/reaper.md`.
-   - Ardour: ALSA vs JACK per `config/daw/ardour.md`.
+   - Ardour: ALSA vs JACK per `config/daw/ardour.md`. The extra package
+     installs `ardour9`, not `ardour`. `bin/omadaw-route launch ardour`
+     tries `ardour`, then `ardour9`, `ardour8`, and `ardour7`.
    - Bitwig: ALSA vs JACK per `config/daw/bitwig.md`.
    - Verify routing in `qpwgraph` (or `helvum`); move streams with
      `bin/omadaw-route set-default sink|source <name>`.

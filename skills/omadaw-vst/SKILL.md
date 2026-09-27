@@ -120,6 +120,34 @@ bin/omadaw-vst sync                          # re-bridge; discovers new/updated 
 bin/omadaw-vst list                          # yabridgectl status + shim inventory
 ```
 
+Do not `yabridgectl add` `~/.vst`, `~/.vst3`, `~/.clap`, or `~/.lv2`.
+Those are where centralized shims are written. Registering one makes the
+next sync bridge its own output.
+
+Symptom: `~/.vst/yabridge/yabridge` and `~/.vst3/yabridge/yabridge` appear,
+the shim count roughly doubles, and `yabridgectl status` lists the copies
+as not yet synced. `bin/omadaw-vst init` used to add `~/.vst` and `~/.vst3`
+on every setup (verified 2026-09-27).
+
+`yabridgectl rm` then asks to delete every leftover `.so` in that
+directory. The real bridges live there. Answer anything other than `YES`
+(a piped `n` is enough), then delete only the nested copy:
+
+```bash
+printf 'n\n' | yabridgectl rm ~/.vst
+printf 'n\n' | yabridgectl rm ~/.vst3
+rm -rf ~/.vst/yabridge/yabridge ~/.vst3/yabridge/yabridge
+bin/omadaw-vst sync
+```
+
+`init` and `sync` now drop those registrations and delete a single nested
+`yabridge/yabridge` directory before syncing. A shim whose Windows file is
+already gone stays as a broken symlink inside the `.vst3` bundle. Doctor
+reports `EMPTY`, and `yabridgectl status` warns that winedump could not
+read the file. `yabridgectl sync --prune` removes that bundle. Unregister
+the Linux dirs before that prune, or the scan treats the bundle as a plugin
+and rebuilds it.
+
 ### Discovery of new/updated plugins
 
 Two layers (both intentional):
@@ -161,6 +189,14 @@ standalone/app first, e.g. Addictive, IK Custom Shop prompts); `CRASH` =
 loader died. Full sweep: `bin/omadaw-vst test --all [--timeout S] [--jobs J]`
  (slow on big collections); or `test <pattern>` for one vendor
 (`test WaveShell`, `test AmpliTube`). Nonzero exit on any failure.
+
+A `TIMEOUT` on WaveShell1 while WaveShell2 and WaveShell3 `PASS`, with a
+non-empty `.wle` and no window, is the shell's size. A 60s budget is shorter
+than the load. WaveShell1 13.0 (VST2 and VST3) enumerated 173 plugins in
+105s with two jobs (verified 2026-09-27). The smoke test's default budget
+is 180s for that reason. Confirm a leftover timeout with
+`bin/omadaw-vst test --timeout 180 --jobs 1 WaveShell1` before treating it
+as an activation dialog.
 6. Waves plugins missing after Central → the Waves Central section above
    (PowerShell verb, pty launch, then `add` the VST2 dir and `sync`).
 

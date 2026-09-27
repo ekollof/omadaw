@@ -18,6 +18,24 @@ log() { printf '[omadaw-route] %s\n' "$*"; }
 warn() { printf '[omadaw-route:warn] %s\n' "$*" >&2; }
 die() { printf '[omadaw-route:error] %s\n' "$*" >&2; exit 1; }
 
+# Arch's ardour package installs ardour9 (ardour8, …), not a bare `ardour`.
+daw_bin() {
+  local name="$1" c
+  case "$name" in
+    bitwig) name=bitwig-studio ;;
+    ardour)
+      for c in ardour ardour9 ardour8 ardour7; do
+        if command -v "$c" >/dev/null 2>&1; then
+          printf '%s\n' "$c"
+          return 0
+        fi
+      done
+      return 1
+      ;;
+  esac
+  command -v "$name" >/dev/null 2>&1 && printf '%s\n' "$name"
+}
+
 cmd_status() {
   echo "== clock =="
   pw-metadata -n settings 2>/dev/null | grep -E "clock.(rate|quantum|allowed-rates)" || echo "(no pw-metadata — is pipewire running?)"
@@ -26,8 +44,13 @@ cmd_status() {
   echo "== rt =="
   id -nG | tr ' ' '\n' | grep -qx realtime && echo "realtime group: yes (ulimit -r $(ulimit -r))" || echo "realtime group: NO — tell the user to reboot or relogin (ulimit -r is $(ulimit -r); want 98)"
   echo "== DAWs =="
-  for d in bitwig-studio reaper ardour; do
-    command -v "$d" >/dev/null 2>&1 && echo "  $d: installed" || echo "  $d: not installed"
+  local d bin
+  for d in bitwig reaper ardour; do
+    if bin="$(daw_bin "$d")"; then
+      echo "  $d: installed ($bin)"
+    else
+      echo "  $d: not installed"
+    fi
   done
 }
 
@@ -111,13 +134,13 @@ cmd_profile() {  [[ $# -eq 1 ]] || die "usage: omadaw-route profile <studio|bala
 
 cmd_launch() {
   [[ $# -ge 1 ]] || die "usage: omadaw-route launch <bitwig|reaper|ardour> [args...]"
-  local daw="$1"; shift
+  local daw="$1" bin; shift
   case "$daw" in
-    bitwig) exec bitwig-studio "$@" ;;
-    reaper) exec reaper "$@" ;;
-    ardour) exec ardour "$@" ;;
+    bitwig|reaper|ardour) ;;
     *) die "unknown daw $daw (bitwig|reaper|ardour)" ;;
   esac
+  bin="$(daw_bin "$daw")" || die "$daw is not installed"
+  exec "$bin" "$@"
 }
 
 cmd_setup_daw_config() {

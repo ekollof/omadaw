@@ -26,14 +26,33 @@ warn() { printf '[omadaw-vst:warn] %s\n' "$*" >&2; }
 die()  { printf '[omadaw-vst:error] %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# Standard plugin locations we always bridge (prefix-local + linux homes).
+# Windows plugin locations we bridge. Linux ~/.vst{,3} are shim outputs, not sources.
 default_plugin_dirs() {
   printf '%s\n' \
     "$PREFIX/drive_c/Program Files/Steinberg/VstPlugins" \
     "$PREFIX/drive_c/Program Files/Common Files/VST3" \
-    "$PREFIX/drive_c/Program Files/Common Files/VST2" \
-    "$HOME/.vst" \
-    "$HOME/.vst3"
+    "$PREFIX/drive_c/Program Files/Common Files/VST2"
+}
+
+# Directories yabridge writes into. Registering one makes sync bridge its own
+# shims and grow yabridge/yabridge/... trees.
+shim_homes() {
+  printf '%s\n' "$HOME/.vst" "$HOME/.vst3" "$HOME/.clap" "$HOME/.lv2"
+}
+
+drop_shim_home_registrations() {
+  local home nest
+  while IFS= read -r home; do
+    mkdir -p "$home"
+    # rm asks to delete every leftover .so under the directory. The real
+    # bridges live there, so refuse that prompt. EOF counts as a refusal.
+    printf 'n\n' | yabridgectl rm "$home" >/dev/null 2>&1 || true
+    nest="$home/yabridge/yabridge"
+    if [[ -d $nest ]]; then
+      rm -rf "$nest"
+      log "removed nested shim dir $nest"
+    fi
+  done < <(shim_homes)
 }
 
 ensure_deps() {
@@ -72,10 +91,12 @@ cmd_init() {
   else
     [[ -d $PREFIX/drive_c ]] || { log "wineboot --init in $PREFIX"; wineboot --init; }
   fi
-  # Create plugin homes + register them with yabridgectl.
-  while IFS= read -r d; do mkdir -p "$d"; done < <(default_plugin_dirs)
+  # Create plugin homes + register the Windows dirs. Shim homes stay
+  # unregistered; a previous init may have added them.
+  drop_shim_home_registrations
   while IFS= read -r d; do
-    if [[ -d $d ]]; then yabridgectl add "$d" 2>/dev/null || true; fi
+    mkdir -p "$d"
+    yabridgectl add "$d" 2>/dev/null || true
   done < <(default_plugin_dirs)
   log "Syncing yabridge…"
   yabridgectl sync || yabridgectl sync --no-verify || warn "sync had errors — run 'omadaw-vst doctor'"
@@ -127,6 +148,7 @@ cmd_add() {
 
 cmd_sync() {
   ensure_deps
+  drop_shim_home_registrations
   log "Syncing yabridge bridges (discovers new/updated plugins)…"
   # --prune removes stale .so shims; plain sync keeps them. Prune is safer
   # after uninstalls, plain sync is safer day-to-day. Do plain, report.
@@ -181,7 +203,8 @@ test_one() {
 }
 
 cmd_test() {
-  local timeout_s=60 jobs=4 all=false
+  # WaveShell1 13.0 enumerates ~173 plugins and needs ~100s on its own.
+  local timeout_s=180 jobs=4 all=false
   local -a patterns=()
   while (($#)); do
     case "$1" in

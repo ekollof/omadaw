@@ -7,7 +7,8 @@
 #   ./omadaw [--yes] [--profile studio|balanced|safe]
 #            [--with-daw bitwig,reaper,ardour|all|none]
 #            [--wine-prefix PATH] [--snapshot] [--agent [extra prompt...]] [--check]
-#   ./omadaw doctor            # health check (idempotent, read-only; same as --check)
+#   ./omadaw doctor            # fast-forward this repo, apply config it changed, then health check
+#   ./omadaw --check           # health check only (no fetch, no pull)
 #   ./omadaw agent ["goal"]    # launch default agent harness in this repo
 #
 # Idempotent: safe to re-run. Uses `omarchy pkg ...` helpers when available
@@ -20,6 +21,7 @@ WITH_DAW="all"
 WINE_PREFIX="${WINEPREFIX:-$HOME/.wine-omadaw}"
 ASSUME_YES=false
 CHECK_ONLY=false
+DOCTOR=false
 TAKE_SNAPSHOT=false
 USE_AGENT=false
 AGENT_EXTRA=""
@@ -38,7 +40,8 @@ usage() {
   echo "  ./omadaw [--yes] [--profile studio|balanced|safe]"
   echo "           [--with-daw bitwig,reaper,ardour|all|none]"
   echo "           [--wine-prefix PATH] [--snapshot] [--agent [extra prompt...]] [--check]"
-  echo "  ./omadaw doctor            # health check (read-only, idempotent)"
+  echo "  ./omadaw doctor            # fast-forward this repo, then health check"
+  echo "  ./omadaw --check           # health check only"
   echo "  ./omadaw agent [\"goal\"]    # default agent harness, repo skills in context"
   echo "  --snapshot snapshots system + user state first (rollback: bin/omadaw-snapshot)."
 }
@@ -68,11 +71,12 @@ if [[ "${1:-}" == "agent" ]]; then
   shift
   USE_AGENT=true
   AGENT_MANAGE=true
-  AGENT_EXTRA="Manage this OmaDAW audio setup: check health with ./omadaw doctor, fix what is broken per skills/omadaw-audio/SKILL.md and skills/omadaw-vst/SKILL.md, then report status. $*"
+  AGENT_EXTRA="Manage this OmaDAW audio setup: check health with ./omadaw doctor. If it prints files to re-read, read those before fixing anything. Fix what is broken per skills/omadaw-audio/SKILL.md and skills/omadaw-vst/SKILL.md, then report status. $*"
   set --
 elif [[ "${1:-}" == "doctor" ]]; then
   shift
   CHECK_ONLY=true
+  DOCTOR=true
 fi
 
 while (($#)); do
@@ -152,6 +156,111 @@ resolve_daws() {
   echo "$sel" | tr ',' ' '
 }
 
+# --------------------------------------------------------------- repo sync ---
+# Name of the installed PipeWire profile, or empty when the installed file
+# matches none of the templates (leave a hand-edited conf alone).
+installed_profile() {
+  local dest="$HOME/.config/pipewire/pipewire.conf.d/10-omadaw.conf" p src
+  [[ -f $dest ]] || return 1
+  for p in studio balanced safe; do
+    src="$REPO_DIR/config/pipewire/pipewire.conf.d/10-omadaw-${p}.conf"
+    if [[ -f $src ]] && cmp -s "$src" "$dest"; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Copy repo-owned user config that the pull actually changed.
+internalize_update() {
+  local old="$1" new="$2" profile="$3" changed dest src
+  changed="$(git -C "$REPO_DIR" diff --name-only "$old" "$new")"
+  [[ -n $changed ]] || return 0
+  while IFS= read -r f; do log "updated: $f"; done <<< "$changed"
+
+  if [[ -n $profile ]] && printf '%s\n' "$changed" | grep -qx "config/pipewire/pipewire.conf.d/10-omadaw-${profile}.conf"; then
+    dest="$HOME/.config/pipewire/pipewire.conf.d/10-omadaw.conf"
+    src="$REPO_DIR/config/pipewire/pipewire.conf.d/10-omadaw-${profile}.conf"
+    mkdir -p "$(dirname "$dest")"
+    cp "$src" "$dest"
+    log "installed PipeWire profile $profile — restarting pipewire"
+    systemctl --user restart pipewire pipewire-pulse wireplumber || warn "pipewire restart failed — relogin will apply it"
+    log "relaunch the DAW so its JACK ports come back"
+  elif printf '%s\n' "$changed" | grep -q '^config/pipewire/pipewire.conf.d/10-omadaw-'; then
+    if [[ -z $profile ]]; then
+      warn "PipeWire profile templates changed, but the installed conf matches none — left it in place"
+    fi
+  fi
+
+  if printf '%s\n' "$changed" | grep -q '^config/systemd/user/omadaw-vst-sync\.'; then
+    if systemctl --user is-enabled --quiet omadaw-vst-sync.path 2>/dev/null; then
+      "$REPO_DIR/bin/omadaw-vst" enable-watch || warn "could not refresh the VST watch unit"
+    else
+      log "VST watch unit files changed; enable them with: bin/omadaw-vst enable-watch"
+    fi
+  fi
+
+  if printf '%s\n' "$changed" | grep -Eq '^(AGENTS\.md|skills/)'; then
+    while IFS= read -r f; do log "re-read: $f"; done < <(printf '%s\n' "$changed" | grep -E '^(AGENTS\.md|skills/)')
+  fi
+}
+
+# Fast-forward this checkout onto its upstream. A dirty tree, a missing
+# upstream, or a diverged history is left untouched. Re-runs doctor when
+# the pull changes this script or bin/, so the new code performs the check.
+repo_update() {
+  local upstream remote branch counts ahead behind old new profile
+  have git || { log "git not available — skipping repo update"; return 0; }
+  git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+    log "not a git checkout — skipping repo update"
+    return 0
+  }
+  upstream="$(git -C "$REPO_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+  if [[ -z $upstream ]]; then
+    log "no upstream — skipping repo update"
+    return 0
+  fi
+  remote="${upstream%%/*}"
+  branch="${upstream#*/}"
+  if ! git -C "$REPO_DIR" fetch --quiet "$remote" "$branch"; then
+    warn "could not fetch $upstream — continuing with this checkout"
+    return 0
+  fi
+  counts="$(git -C "$REPO_DIR" rev-list --left-right --count "HEAD...$upstream")"
+  ahead="${counts%%$'\t'*}"
+  behind="${counts#*$'\t'}"
+  if [[ $ahead -eq 0 && $behind -eq 0 ]]; then
+    log "ok: repo matches $upstream"
+    return 0
+  fi
+  if [[ $ahead -gt 0 && $behind -gt 0 ]]; then
+    warn "repo has diverged from $upstream ($ahead local, $behind remote) — not pulling"
+    return 0
+  fi
+  if [[ $behind -eq 0 ]]; then
+    log "ok: repo is $ahead commit(s) ahead of $upstream"
+    return 0
+  fi
+  if [[ -n $(git -C "$REPO_DIR" status --porcelain --untracked-files=no) ]]; then
+    warn "repo is $behind commit(s) behind $upstream but the worktree has local changes — not pulling"
+    return 0
+  fi
+  profile="$(installed_profile || true)"
+  old="$(git -C "$REPO_DIR" rev-parse HEAD)"
+  log "pulling $behind commit(s) from $upstream"
+  if ! git -C "$REPO_DIR" pull --ff-only --quiet "$remote" "$branch"; then
+    warn "fast-forward from $upstream failed — continuing with this checkout"
+    return 0
+  fi
+  new="$(git -C "$REPO_DIR" rev-parse HEAD)"
+  internalize_update "$old" "$new" "$profile"
+  if git -C "$REPO_DIR" diff --name-only "$old" "$new" | grep -Eq '^(omadaw|bin/)'; then
+    log "scripts changed — re-running doctor"
+    exec "$REPO_DIR/omadaw" doctor
+  fi
+}
+
 # ------------------------------------------------------------------ check ---
 do_check() {
   local fail=0
@@ -173,6 +282,7 @@ do_check() {
 }
 
 if $CHECK_ONLY; then
+  $DOCTOR && repo_update
   do_check
   exit $?
 fi
@@ -298,7 +408,7 @@ echo "  - Reboot (or log out and back in) if this session was started before joi
 echo "    Check: id    # must list realtime without passing your username; ulimit -r must print 98."
 echo "    A logout that leaves systemd --user running does not apply the group; reboot does."
 if $RUN_AGENT_AFTER_SETUP; then
-  launch_agent "Setup just finished (profile=$PROFILE, daws=$WITH_DAW, wine-prefix=$WINE_PREFIX). Read MEMORY.md. Check health with ./omadaw doctor, fix what is broken per skills/omadaw-audio/SKILL.md and skills/omadaw-vst/SKILL.md, then help the user get to work. Ask before installing a paid DAW (Bitwig) if it is not already licensed/installed."
+  launch_agent "Setup just finished (profile=$PROFILE, daws=$WITH_DAW, wine-prefix=$WINE_PREFIX). Read MEMORY.md. Check health with ./omadaw doctor. If it prints files to re-read, read those before fixing anything. Fix what is broken per skills/omadaw-audio/SKILL.md and skills/omadaw-vst/SKILL.md, then help the user get to work. Ask before installing a paid DAW (Bitwig) if it is not already licensed/installed."
 fi
 echo "  - Check: ./omadaw doctor"
 echo "  - Install a Windows VST: bin/omadaw-vst install ~/Downloads/SomePluginSetup.exe"

@@ -16,7 +16,7 @@ you can do: logins, licenses, and listening.
 ```bash
 ./omadaw                                         # set up, then open the agent
 ./omadaw --profile studio --with-daw all --yes   # set up only (idempotent)
-./omadaw doctor                                  # health check
+./omadaw doctor                                  # fast-forward this repo, then health check
 ./omadaw agent "set up for a USB interface at 128 frames with Reaper"
 ```
 
