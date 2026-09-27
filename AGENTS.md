@@ -28,6 +28,12 @@ Windows VSTs, and routing/config for Bitwig, Reaper, Ardour.
 - **This machine:** read `MEMORY.md` before rediscovering interfaces, which
   DAWs are installed, or the plugin inventory. Record machine-specific
   findings there. Skills stay general.
+- **Contribute general quirks:** when a failure would happen on another
+  OmaDAW machine, add it to the matching `skills/*/SKILL.md` in the same
+  change as the fix. Symptom, cause, and the command that fixes it. The
+  Native Access `native-access://` handler and the Guitar Rig 5 `vcrun2013`
+  crash are the examples. Do not put hostnames, serials, license files, or
+  this install's inventory in the skill or the commit.
 
 ## Repo map
 
@@ -106,4 +112,5 @@ pw-metadata -n settings | grep -E "clock.(rate|quantum)"
 
 Keep changes small, scripts `shellcheck`-clean, and update the relevant
 `skills/*/SKILL.md` when you learn a new failure mode that applies to any
-OmaDAW machine. Findings about this install go in `MEMORY.md`.
+OmaDAW machine. That update is part of finishing the task, not an optional
+note. Findings about this install go in `MEMORY.md`, which is gitignored.

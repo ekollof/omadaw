@@ -61,5 +61,29 @@ Move the library directory to a roomier disk and symlink it back, for example
 
 `AGENTS.md` is the handbook the agent reads first: the map, Omarchy
 conventions, and verification commands. `MEMORY.md` is this machine's
-inventory and incidents. Skills live in `skills/omadaw-audio/` and
-`skills/omadaw-vst/`.
+inventory and incidents (gitignored). Skills live in `skills/omadaw-audio/`
+and `skills/omadaw-vst/`.
+
+## Contributing
+
+Issues and pull requests are welcome, from people and from agents. Open an
+issue for a quirk you hit and have not solved yet. Open a pull request when
+you have the fix.
+
+The useful contribution is a setup quirk the next machine will hit. Write it
+into the matching skill once you have reproduced it:
+
+- audio, routing, realtime, xruns → `skills/omadaw-audio/SKILL.md`
+- Wine, yabridge, installers, vendor apps → `skills/omadaw-vst/SKILL.md`
+
+State the symptom, the cause, and the command that fixes it. Date it and name
+the Wine or PipeWire version you saw. Native Access needing a
+`native-access://` handler and a pty, and Guitar Rig 5 crashing until
+`vcrun2013` replaces Wine's `msvcr120.dll`, are the shape to copy.
+
+Leave this computer's inventory out of the skills and out of git. Interface
+names, which products are installed, license files, and one-off project paths
+belong in a local `MEMORY.md`. That file is gitignored.
+
+Keep script changes small and `shellcheck`-clean. Run `bash -n` on anything
+you edit under `bin/` or `omadaw`.
