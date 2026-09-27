@@ -9,6 +9,8 @@ need. The agent reads `AGENTS.md` and the skills in `skills/`, then runs the
 idempotent scripts in this repo. You stay in the session for the parts only
 you can do: logins, licenses, and listening.
 
+![Reaper at 128 frames, with Guitar Rig 5, EZdrummer 2, and EZmix 2 bridged through yabridge](docs/reaper-bridged-plugins.jpg)
+
 ## Work with the agent
 
 ```bash
