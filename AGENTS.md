@@ -25,6 +25,9 @@ Windows VSTs, and routing/config for Bitwig, Reaper, Ardour.
     Triggers: VST, yabridge, setup.exe, plugin missing from DAW, Waves Central.
   - The `omarchy` skill (if present) governs desktop/window config — out of scope
     here except `omarchy audio ...` sink/source helpers.
+- **This machine:** read `MEMORY.md` before rediscovering interfaces, which
+  DAWs are installed, or the plugin inventory. Record machine-specific
+  findings there. Skills stay general.
 
 ## Repo map
 
@@ -39,6 +42,7 @@ Windows VSTs, and routing/config for Bitwig, Reaper, Ardour.
 | `config/daw/{bitwig,reaper,ardour}.md` | Backend + plugin-path notes per DAW |
 | `config/systemd/user/omadaw-vst-sync.{path,service}` | New/updated-VST auto-discovery unit |
 | `skills/*/` | Agent skills (this file points at them; they own the details) |
+| `MEMORY.md` | This machine only: interface, installed DAWs, plugin inventory, incidents |
 
 ## Facts already verified (don't re-derive; re-check only if suspect)
 
@@ -101,4 +105,5 @@ pw-metadata -n settings | grep -E "clock.(rate|quantum)"
 ```
 
 Keep changes small, scripts `shellcheck`-clean, and update the relevant
-`skills/*/SKILL.md` when you learn a new failure mode.
+`skills/*/SKILL.md` when you learn a new failure mode that applies to any
+OmaDAW machine. Findings about this install go in `MEMORY.md`.

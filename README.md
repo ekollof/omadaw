@@ -12,16 +12,18 @@ you can do: logins, licenses, and listening.
 ## Work with the agent
 
 ```bash
-./omadaw --profile studio --with-daw all --yes   # set up (idempotent)
+./omadaw                                         # set up, then open the agent
+./omadaw --profile studio --with-daw all --yes   # set up only (idempotent)
 ./omadaw doctor                                  # health check
 ./omadaw agent "set up for a USB interface at 128 frames with Reaper"
 ```
 
-`./omadaw agent "<goal>"` opens the Omarchy default agent with this repo as
-context. A goal is a sentence: install a plugin, fix a silent DAW, bridge a
-new VST, or drop the quantum to 128. The skills tell the agent what is
-already known on this machine, so it does not rediscover the audio stack
-from scratch.
+`./omadaw` with no arguments runs the installer, then opens the Omarchy
+default agent in this repo so you can keep going. `./omadaw agent "<goal>"`
+opens that agent directly. A goal is a sentence: install a plugin, fix a
+silent DAW, bridge a new VST, or drop the quantum to 128. The agent reads
+`AGENTS.md`, `MEMORY.md`, and the skills, so it does not rediscover this
+machine from scratch.
 
 ## What the agent sets up
 
@@ -56,5 +58,6 @@ Move the library directory to a roomier disk and symlink it back, for example
 ## Repo layout
 
 `AGENTS.md` is the handbook the agent reads first: the map, Omarchy
-conventions, and verification commands. Skills live in `skills/omadaw-audio/`
-and `skills/omadaw-vst/`.
+conventions, and verification commands. `MEMORY.md` is this machine's
+inventory and incidents. Skills live in `skills/omadaw-audio/` and
+`skills/omadaw-vst/`.
